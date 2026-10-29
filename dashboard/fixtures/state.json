@@ -1,0 +1,33 @@
+{
+  "version": "5.1.8",
+  "mode": "SELL_LIMIT",
+  "capitalStart": 100,
+  "capitalContributed": 100,
+  "cash": 70,
+  "pearl": 16.13,
+  "cycles": 8,
+  "realizedProfit": 0.27,
+  "highestEquity": 100.38,
+  "maxDrawdown": 0.42,
+  "buyOrdersPlaced": 12,
+  "buyOrdersCancelled": 3,
+  "buyOrdersFilled": 9,
+  "buyOrdersExpired": 1,
+  "sellOrdersPlaced": 8,
+  "sellOrdersFilled": 8,
+  "targetExits": 7,
+  "stopExits": 1,
+  "causalBuyFillsBlocked": 2,
+  "causalSellFillsBlocked": 1,
+  "causalRecoveryFillsBlocked": 0,
+  "position": {
+    "entryPrice": 1.8563,
+    "investedUSDT": 30,
+    "pearl": 16.13,
+    "sellTarget": 1.8647,
+    "openedAt": "2026-10-28T20:53:59.326Z"
+  },
+  "sellOrder": { "price": 1.8647, "placedAt": "2026-10-28T20:54:01.000Z" },
+  "recoveryPositions": [],
+  "fallingMarketLock": { "status": "INACTIVE" }
+}

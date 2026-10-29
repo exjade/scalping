@@ -1,0 +1,10 @@
+{
+  "cycles": 8,
+  "targetExits": 7,
+  "stopExits": 1,
+  "realizedProfit": 0.2691,
+  "capitalContributed": 100,
+  "openRecoveries": [],
+  "highestEquity": 100.38,
+  "maxDrawdown": 0.42
+}
