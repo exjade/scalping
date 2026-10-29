@@ -5,7 +5,7 @@ const WebSocket = require("ws");
 const { createRuntimeApi } = require("./dashboard/runtime-api.cjs");
 
 // ============================================================
-// PEARL / USDT PAPER SCALPER V5.1.8.2
+// PEARL / USDT PAPER SCALPER V5.1.8.3
 // ============================================================
 // 100% PAPER — NO API KEY — NO REAL ORDERS
 //
@@ -17,8 +17,8 @@ const { createRuntimeApi } = require("./dashboard/runtime-api.cjs");
 // - BUY LIMIT estática por intento (sin reprice alcista)
 // - soporte automático de 60 min SOLO como referencia bajista
 // - ticker rolling 24 h de BigONE (open/high/low/close/volume)
-// - V5.1.8.2: usar high24h como ENTRY LADDER dinámico para no comprar en el mismo escalón del máximo
-// - V5.1.8.2: NORMAL_SCALP -> SOFT_FALLING_CAUTION(30%) -> HARD_FALLING_LOCK(0%)
+// - V5.1.8.3: usar high24h como ENTRY LADDER dinámico para no comprar en el mismo escalón del máximo
+// - V5.1.8.3: NORMAL_SCALP -> SOFT_FALLING_CAUTION(30%) -> HARD_FALLING_LOCK(0%)
 // - cancelar BUY pendiente solo ante ruptura bajista material confirmada
 // - stop defensivo normal SOLO si respeta el capital protegido
 // - ruptura estructural NO liquida: mueve la posición a RECOVERY_HOLD
@@ -47,12 +47,12 @@ const SELL_FEE = 0.002;  // 0.20%
 const TARGET_GROSS = 0.0045; // +0.4500% movimiento de precio
 
 // ============================================================
-// V5.1.8.2 — RECOVERY / CAPITAL BUCKETS / ANCHORED 24H SUPPORT
+// V5.1.8.3 — RECOVERY / CAPITAL BUCKETS / ANCHORED 24H SUPPORT
 // ============================================================
 // Una ruptura estructural ya NO realiza una pérdida de 1–3% automáticamente.
 // La posición se separa del SCALP_BUCKET y pasa a RECOVERY_HOLD.
 //
-// V5.1.8.2 cambia el significado del -10%:
+// V5.1.8.3 cambia el significado del -10%:
 // -10% = RECOVERY_DANGER (alarma), NO venta.
 // El HARD STOP real requiere además invalidar el LOW 24H ANCLADO al momento
 // de entrar en recovery: romperlo 1.5%, permanecer debajo ~2 min, mantener
@@ -68,8 +68,15 @@ const RECOVERY_ANCHOR_ASK_SHARE_30S = 0.70;       // presión vendedora rápida
 const RECOVERY_EXIT_BUFFER_PCT = 0.0002;          // +0.02% sobre break-even exacto
 const MIN_SCALP_CASH_USDT = 1.00;
 
+// V5.1.8.3 — MULTI-POSITION CON LAS MISMAS REGLAS DE ENTRADA.
+// Solo una BUY LIMIT pendiente a la vez; pueden coexistir varias SELL LIMIT.
+// Cada posición individual usa como máximo 30% del capital operativo y debe
+// estar separada >=0.25% de toda posición/recovery abierta.
+const MULTI_POSITION_MAX_CAPITAL_FRACTION = 0.30;
+const MIN_POSITION_SPACING_PCT = 0.0025; // 0.25%
+
 // ============================================================
-// V5.1.8.2 — STARTUP CONTEXT + EXHAUSTION CAUTION
+// V5.1.8.3 — STARTUP CONTEXT + EXHAUSTION CAUTION
 // ============================================================
 // El bot NO compra a ciegas al arrancar. Durante 4 minutos observa trades LIVE
 // del proceso actual. El snapshot histórico sigue sirviendo para soportes/rangos,
@@ -90,7 +97,7 @@ const HIGH_RANGE_CAUTION_MICRO_DROP = 0.0005;
 const HIGH_RANGE_CAUTION_MIN_EXHAUSTION_VOTES = 2;
 const HIGH_RANGE_CAUTION_CAPITAL_FRACTION = 0.30;
 
-// V5.1.8.2 — RANGE POSITION SIZING + PRICE LADDER GATE
+// V5.1.8.3 — RANGE POSITION SIZING + PRICE LADDER GATE
 // <=75% del rango 24h: puede usar 100% del SCALP_BUCKET.
 // >75% y <=82%: máximo 30%.
 // >82%: NO RANGE BUY.
@@ -104,7 +111,7 @@ const RANGE_CAUTION_CAPITAL_FRACTION = 0.30;
 const PRICE_LADDER_STEP = 0.10;
 const PRICE_LADDER_BREAK_CONFIRM_TICKS = 1;
 
-// V5.1.8.2 — PRE-ENTRY FALLING REGIME.
+// V5.1.8.3 — PRE-ENTRY FALLING REGIME.
 // La volatilidad normal NO debe apagar el scalper. Separamos:
 // NORMAL_SCALP -> SOFT_FALLING_CAUTION (30%) -> HARD_FALLING_LOCK (0%).
 //
@@ -134,7 +141,7 @@ const PREENTRY_FALLING_MICRO_DROP = 0.0010;
 const PREENTRY_FALLING_NEAR_LOW_PCT = 0.0020;
 
 // ============================================================
-// V5.1.8.2 — ENTRY STABILITY GATE / SLOW-BLEED PROTECTION
+// V5.1.8.3 — ENTRY STABILITY GATE / SLOW-BLEED PROTECTION
 // ============================================================
 // La zona de precio permitida NO basta para comprar. Si el mercado viene
 // descendiendo materialmente, esperamos que deje de hacer mínimos y que 10m/5m/30s
@@ -153,7 +160,7 @@ const ENTRY_STABILITY_MIN_BOUNCE_FROM_LOW_5M = 0.0015; // +0.15% desde low5m
 const ENTRY_STABILITY_TIGHT_RANGE_5M = 0.0030;       // o rango5m <=0.30%
 
 // ============================================================
-// V5.1.8.2 — FALLING MARKET LOCK / STABILITY GATE
+// V5.1.8.3 — FALLING MARKET LOCK / STABILITY GATE
 // ============================================================
 // Si una posición pasa a RECOVERY_HOLD por ruptura estructural, el cash
 // restante NO se reutiliza durante la caída. El lock solo se libera cuando
@@ -183,14 +190,14 @@ const BREAKDOWN_RECLAIM_CONFIRM_MS = 2 * 60 * 1000;
 const BREAKDOWN_NEW_SUPPORT_PCT = 0.0050;    // nuevo soporte >=0.50% más abajo
 
 // Inyección PAPER opcional. Ejemplo Git Bash:
-// PAPER_INJECT_USDT=100 PAPER_INJECT_ID=extra-100-1 node pearl-scalper-v5.1.8.2.cjs
+// PAPER_INJECT_USDT=100 PAPER_INJECT_ID=extra-100-1 node pearl-scalper-v5.1.8.3.cjs
 // El ID evita aplicar dos veces la misma aportación al reiniciar.
 const PAPER_INJECT_USDT = Number(process.env.PAPER_INJECT_USDT || 0);
 const PAPER_INJECT_ID = String(process.env.PAPER_INJECT_ID || "").trim();
 
 const TICK = 0.0001;
 
-// V5.1.8.2 — comparación robusta de precios al tick.
+// V5.1.8.3 — comparación robusta de precios al tick.
 // Un trade un tick o más allá de la LIMIT cuenta como cross-through.
 const PRICE_EPSILON = TICK / 2;
 
@@ -199,7 +206,7 @@ const PROCESS_STARTED_AT_MS = Date.now();
 const liveTradesSinceProcessStart = [];
 
 // ============================================================
-// V5.1.8.2 — STRICT CAUSAL FILL AUDIT
+// V5.1.8.3 — STRICT CAUSAL FILL AUDIT
 // ============================================================
 // Un trade puede alimentar métricas aunque venga de REST/WS en lote,
 // pero solo puede llenar una orden si fue OBSERVADO después de que
@@ -296,14 +303,14 @@ const MAX_LOW_AGE_MS = 3 * 60 * 1000;
 const COOLDOWN_MS = 15 * 1000;
 
 // ============================================================
-// V5.1.8.2 — EARLY ARM / MAKER PRIORITY
+// V5.1.8.3 — EARLY ARM / MAKER PRIORITY
 // ============================================================
 // La orden LIMIT se arma ANTES de exigir la señal completa.
 // Objetivo: que la orden ya esté descansando en el libro cuando
 // el precio llegue a la zona candidata. La señal dura sigue
 // calculándose y se registra cuando aparece, pero no esperamos
 // a ella para colocar la LIMIT.
-// V5.1.8.2: el EARLY ARM NO espera confirmación de FLOW 5m, drawdown ni rango duro.
+// V5.1.8.3: el EARLY ARM NO espera confirmación de FLOW 5m, drawdown ni rango duro.
 // Si ya existe una zona maker válida, cercana y debajo del mercado, la LIMIT
 // se arma inmediatamente para ganar prioridad temporal en el libro.
 const EARLY_ARM_MIN_DISTANCE = 0.0002;       // BUY al menos 0.02% debajo del último trade
@@ -344,7 +351,7 @@ const RESISTANCE_BUFFER_MAX_PCT = 0.0015;
 const RESISTANCE_BUFFER_SPREAD_FACTOR = 0.50;
 
 // ============================================================
-// V5.1.8.2 — 24H RANGE + DOWNSIDE STRUCTURAL STOP
+// V5.1.8.3 — 24H RANGE + DOWNSIDE STRUCTURAL STOP
 // ============================================================
 
 // HIGH 24h = contexto, nunca una resistencia que bloquee una subida.
@@ -362,7 +369,7 @@ const STRUCTURAL_STOP_MIN_DROP_30S = 0.0010;   // momentum30 <= -0.10%
 const BUY_TTL_MS = 90 * 1000;
 
 // ============================================================
-// V5.1.8.2 — STATIC EARLY-ARM BUY ATTEMPT
+// V5.1.8.3 — STATIC EARLY-ARM BUY ATTEMPT
 // ============================================================
 
 // La BUY permanece FIJA durante todo el intento.
@@ -376,7 +383,7 @@ const BUY_TTL_MS = 90 * 1000;
 // FILL MODEL
 // ============================================================
 
-// V5.1.8.2: en toque exacto exigimos cola + tamaño propio, sin 10% extra.
+// V5.1.8.3: en toque exacto exigimos cola + tamaño propio, sin 10% extra.
 // Si el mercado ATRAVIESA la LIMIT, el fill es inmediato y este factor no aplica.
 const FILL_SAFETY = 1.00;
 
@@ -390,7 +397,7 @@ const FAST_FLOW_WINDOW_MS = 30 * 1000;
 // Para ABRIR una señal nueva seguimos usando contexto de 5 min.
 const MAX_ASK_SHARE_FOR_ENTRY = 0.62;
 
-// V5.1.8.2 — INVALIDACIÓN DE BUY PENDIENTE
+// V5.1.8.3 — INVALIDACIÓN DE BUY PENDIENTE
 //
 // Tocar o cruzar ligeramente nuestra BUY NO invalida la idea.
 // Eso es justamente la zona donde queremos ser llenados.
@@ -417,7 +424,7 @@ const STOP_MIN_HOLD_MS = 2 * 60 * 1000;
 // PROFIT FLOOR
 // ============================================================
 
-// V5.1.8.2: el stop defensivo normal protege el principal COMPLETO del
+// V5.1.8.3: el stop defensivo normal protege el principal COMPLETO del
 // SCALP_BUCKET activo. Una ruptura estructural tampoco vende: migra a recovery.
 // -10% en recovery SOLO arma RECOVERY_DANGER. El escape con pérdida requiere
 // ruptura confirmada del low24hAnchor (1.5% + 2 min + presión vendedora + no reclaim).
@@ -504,7 +511,7 @@ function initialState() {
   const now = Date.now();
 
   return {
-    version: "5.1.8.2",
+    version: "5.1.8.3",
 
     startedAt: iso(now),
     startedAtMs: now,
@@ -529,6 +536,10 @@ function initialState() {
     realizedProfit: 0,
 
     buyOrder: null,
+    scalpPositions: [],
+    scalpPositionsOpened: 0,
+    positionSpacingBlocks: 0,
+    // Vista legacy para dashboard existente; apunta al primer scalp abierto.
     position: null,
     sellOrder: null,
 
@@ -542,7 +553,7 @@ function initialState() {
     buyOrdersFilled: 0,
     buyOrdersExpired: 0,
 
-    // V5.1.8.2: LIMIT colocadas mediante armado anticipado.
+    // V5.1.8.3: LIMIT colocadas mediante armado anticipado.
     earlyBuyOrdersArmed: 0,
     hardSignalsConfirmedWhileArmed: 0,
 
@@ -565,7 +576,7 @@ function initialState() {
     // habría dejado el capital por debajo del piso protegido.
     capitalFloorBlockedStops: 0,
 
-    // V5.1.8.2: ruptura estructural inicia recovery; ya no vende inmediatamente.
+    // V5.1.8.3: ruptura estructural inicia recovery; ya no vende inmediatamente.
     structuralStopExits: 0,
     recoveryHoldsStarted: 0,
     recoveryBreakEvenExits: 0,
@@ -576,7 +587,7 @@ function initialState() {
     breakdownLocksCreated: 0,
     breakdownLocksReleased: 0,
 
-    // V5.1.8.2 — régimen de agotamiento / lock de caída.
+    // V5.1.8.3 — régimen de agotamiento / lock de caída.
     fallingMarketLock: null,
     fallingMarketLocksCreated: 0,
     fallingMarketLocksReleased: 0,
@@ -594,11 +605,11 @@ if (fs.existsSync(STATE_FILE)) {
   try {
     const previous = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
 
-    if (["5.1.8.2", "5.1.8.1", "5.1.8"].includes(previous.version)) {
+    if (["5.1.8.3", "5.1.8.2", "5.1.8.1", "5.1.8"].includes(previous.version)) {
       state = previous;
       const resumedFromVersion = previous.version;
-      state.version = "5.1.8.2";
-      console.log(`♻️ Reanudando estado ${resumedFromVersion} en V5.1.8.2 (misma carpeta/runtime)`);
+      state.version = "5.1.8.3";
+      console.log(`♻️ Reanudando estado ${resumedFromVersion} en V5.1.8.3 (misma carpeta/runtime)`);
     }
   } catch (error) {
     console.log("No pude cargar state.json:", error.message);
@@ -632,11 +643,88 @@ function normalizeV515State() {
   state.softFallingCautionOrders = Number(state.softFallingCautionOrders || 0);
   state.entryStabilityBlocks = Number(state.entryStabilityBlocks || 0);
   state.entryStabilityCancels = Number(state.entryStabilityCancels || 0);
+  state.scalpPositions = Array.isArray(state.scalpPositions) ? state.scalpPositions : [];
+  state.scalpPositionsOpened = Number(state.scalpPositionsOpened || 0);
+  state.positionSpacingBlocks = Number(state.positionSpacingBlocks || 0);
+
+  // Migración transparente desde 5.1.8.2/5.1.8.1.
+  if (!state.scalpPositions.length && state.position) {
+    state.scalpPositionsOpened += 1;
+    state.scalpPositions.push({
+      ...state.position,
+      id: state.position.id || `scalp-migrated-${Date.now()}-${state.scalpPositionsOpened}`,
+      sellOrder: state.sellOrder || state.position.sellOrder || null
+    });
+  }
+
+  for (const position of state.scalpPositions) {
+    if (!position.id) {
+      state.scalpPositionsOpened += 1;
+      position.id = `scalp-${Date.now()}-${state.scalpPositionsOpened}`;
+    }
+    if (!position.sellOrder && state.scalpPositions.length === 1 && state.sellOrder) {
+      position.sellOrder = state.sellOrder;
+    }
+  }
+
+  syncLegacyScalpView();
 }
 
 normalizeV515State();
 
+function openScalpPositions() {
+  return Array.isArray(state.scalpPositions) ? state.scalpPositions : [];
+}
+
+function scalpCostBasis() {
+  return (Number(state.cash) || 0) + openScalpPositions().reduce(
+    (sum, p) => sum + (Number(p.investedUSDT) || 0),
+    0
+  );
+}
+
+function syncLegacyScalpView() {
+  const positions = Array.isArray(state.scalpPositions) ? state.scalpPositions : [];
+  state.pearl = positions.reduce((sum, p) => sum + (Number(p.pearlReceived) || 0), 0);
+  state.position = positions[0] || null;
+  state.sellOrder = positions[0]?.sellOrder || null;
+  state.mode = state.buyOrder ? "BUY_LIMIT" : positions.length ? "SELL_LIMIT" : "WAITING";
+}
+
+function positionSpacingContext(candidatePrice) {
+  const price = Number(candidatePrice);
+  if (!Number.isFinite(price) || price <= 0) {
+    return { ok: false, nearestEntry: null, nearestDistancePct: null, reason: "INVALID_CANDIDATE_PRICE" };
+  }
+
+  const refs = [
+    ...openScalpPositions().map((p) => ({ id: p.id, type: "SCALP", entryPrice: Number(p.entryPrice) })),
+    ...state.recoveryPositions.map((p) => ({ id: p.id, type: "RECOVERY", entryPrice: Number(p.entryPrice) }))
+  ].filter((x) => Number.isFinite(x.entryPrice) && x.entryPrice > 0);
+
+  if (!refs.length) {
+    return { ok: true, nearestEntry: null, nearestDistancePct: null, nearestPositionId: null, nearestType: null, reason: null };
+  }
+
+  let nearest = null;
+  for (const ref of refs) {
+    const distancePct = Math.abs(price / ref.entryPrice - 1);
+    if (!nearest || distancePct < nearest.distancePct) nearest = { ...ref, distancePct };
+  }
+
+  const ok = nearest.distancePct + 1e-12 >= MIN_POSITION_SPACING_PCT;
+  return {
+    ok,
+    nearestEntry: nearest.entryPrice,
+    nearestDistancePct: nearest.distancePct,
+    nearestPositionId: nearest.id,
+    nearestType: nearest.type,
+    reason: ok ? null : "TOO_CLOSE_TO_OPEN_POSITION"
+  };
+}
+
 function saveState() {
+  syncLegacyScalpView();
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
 }
 
@@ -1015,7 +1103,7 @@ function priceMomentum(now = Date.now(), windowMs = FAST_FLOW_WINDOW_MS) {
 }
 
 // ============================================================
-// V5.1.8.2 — MARKET REFERENCE / SPARSE-TRADE FALLBACK
+// V5.1.8.3 — MARKET REFERENCE / SPARSE-TRADE FALLBACK
 // ============================================================
 // El EARLY_ARM no debe quedarse paralizado solo porque en los últimos 5 min
 // haya menos de 10 ejecuciones. Para decidir dónde DEJAR una LIMIT podemos usar
@@ -1165,7 +1253,7 @@ function metrics() {
 }
 
 // ============================================================
-// V5.1.8.2 — MULTI-WINDOW MARKET STATE (10m / 5m / 30s)
+// V5.1.8.3 — MULTI-WINDOW MARKET STATE (10m / 5m / 30s)
 // ============================================================
 
 function tradeWindowStats(windowMs, endOffsetMs = 0, now = Date.now()) {
@@ -1242,7 +1330,7 @@ function highRangeCautionContext(metric = null) {
   const sellPressure = flow5.askShare !== null && flow5.askShare >= HIGH_RANGE_CAUTION_ASK_SHARE;
   const microDrop = mom30.move !== null && mom30.move <= -HIGH_RANGE_CAUTION_MICRO_DROP;
   const exhaustionVotes = [pullback, lowerHigh, sellPressure, microDrop].filter(Boolean).length;
-  // V5.1.8.2: 24h high-range ya NO es requisito. Una subida fuerte con 2 señales
+  // V5.1.8.3: 24h high-range ya NO es requisito. Una subida fuerte con 2 señales
   // de agotamiento activa cautela aunque esté, por ejemplo, en 70–80% del rango.
   // Si además está >=85%, una sola señal de agotamiento basta como precaución.
   const active = strongRun && (
@@ -1513,7 +1601,7 @@ function maybeActivatePreEntryFallingLock(referencePrice = null) {
   if (!startup.ready) return false;
   if (!Number.isFinite(referencePrice) || referencePrice <= 0) return false;
 
-  // V5.1.8.2: SOLO el régimen HARD crea un lock real.
+  // V5.1.8.3: SOLO el régimen HARD crea un lock real.
   // SOFT_FALLING_CAUTION continúa operando con sizing reducido.
   if (!startup.falling?.hardLock) return false;
 
@@ -1615,11 +1703,17 @@ function scalpAllocation(signal = null) {
   if (!zone.ladder.ok) mode = "PRICE_LADDER_BLOCKED";
   if (!zone.range.ok) mode = zone.range.mode;
 
-  const capital = available * fraction;
+  // V5.1.8.3: misma lógica de régimen, con un cap por posición para que
+  // el cash restante pueda seguir operando en oportunidades separadas.
+  const regimeCapital = available * fraction;
+  const slotCap = Math.max(0, scalpCostBasis() * MULTI_POSITION_MAX_CAPITAL_FRACTION);
+  const capital = Math.min(available, regimeCapital, slotCap);
+
   return {
     mode,
     fraction,
     capital,
+    slotCap,
     reserveAfterFill: Math.max(0, available - capital),
     caution: zone.exhaustion,
     falling,
@@ -1712,7 +1806,7 @@ function fallingMarketStabilityContext(referencePrice = null) {
   let entryStability = entryStabilityContext(current);
 
   if (isPreEntryHardLock) {
-    // V5.1.8.2: no retenemos el capital 5 minutos extra cuando el shock ya murió.
+    // V5.1.8.3: no retenemos el capital 5 minutos extra cuando el shock ya murió.
     const fiveMinuteNotFalling =
       w5.ready && w5.move !== null && w5.move >= -PREENTRY_HARD_RELEASE_MAX_DROP_5M;
     const microNotFalling =
@@ -2313,31 +2407,20 @@ function assessStructureForEntry(buyPrice, target) {
 
 function activeScalpEquity() {
   let equity = Number(state.cash) || 0;
+  const bid = bestBid();
 
-  if (state.position && state.mode === "SELL_LIMIT") {
-    const simulated = simulateMarketSell(state.pearl);
-    if (simulated) {
-      equity += simulated.netUSDT;
-    } else {
-      const bid = bestBid();
-      equity += bid
-        ? state.pearl * bid * (1 - SELL_FEE)
-        : state.position.investedUSDT;
-    }
+  for (const position of openScalpPositions()) {
+    const simulated = simulateMarketSell(position.pearlReceived);
+    if (simulated) equity += simulated.netUSDT;
+    else equity += bid ? position.pearlReceived * bid * (1 - SELL_FEE) : position.investedUSDT;
   }
 
   return equity;
 }
 
-function protectedCapitalFloor() {
-  // El principal protegido corresponde SOLO al scalp activo.
-  // Si estamos comprados, no permitimos un stop defensivo por debajo del
-  // capital que esa posición realmente invirtió.
-  if (state.position && Number.isFinite(state.position.investedUSDT)) {
-    return state.position.investedUSDT;
-  }
-
-  return Math.max(0, Number(state.cash) || 0);
+function protectedCapitalFloor(position = null) {
+  if (position && Number.isFinite(position.investedUSDT)) return position.investedUSDT;
+  return scalpCostBasis();
 }
 
 function riskableProfitBuffer() {
@@ -2493,7 +2576,7 @@ function failedConditionNames(conditions) {
 // Señal DURA heredada: sirve para diagnóstico / confirmación posterior.
 // V5.1 ya NO espera a que esta señal sea completa para armar la LIMIT.
 function buildHardSignal(ignoreMode = false) {
-  if (!ignoreMode && state.mode !== "WAITING") return null;
+  if (!ignoreMode && state.buyOrder) return null;
 
   const cooldownOK = Date.now() - state.lastExitTimeMs >= COOLDOWN_MS;
   const metric = earlyArmMetric();
@@ -2518,6 +2601,7 @@ function buildHardSignal(ignoreMode = false) {
     breakdownLockOK: breakdownGate.ok,
     priceLadderOK: entryZone.ladder.ok,
     rangePosition24hOK: entryZone.range.ok,
+    positionSpacingOK: positionSpacingContext(buyPrice).ok,
     cooldownOK,
     drawdownOK: metric.drawdown >= MIN_DRAWDOWN,
     lowZoneOK: metric.rangePosition <= MAX_RANGE_POSITION,
@@ -2551,7 +2635,7 @@ function buildHardSignal(ignoreMode = false) {
   };
 }
 
-// Señal TEMPRANA V5.1.8.2: si el bot YA tiene una zona maker válida,
+// Señal TEMPRANA V5.1.8.3: si el bot YA tiene una zona maker válida,
 // la LIMIT se arma inmediatamente. NO esperamos ASK5m, drawdown 0.35%,
 // rango 0.45% ni otras confirmaciones lentas para colocar la orden.
 //
@@ -2559,7 +2643,7 @@ function buildHardSignal(ignoreMode = false) {
 // El hardSignal sigue existiendo como confirmación posterior.
 // La BUY puede llenarse antes de que llegue ese hardSignal.
 function buildEarlyArmSignal(ignoreMode = false) {
-  if (!ignoreMode && state.mode !== "WAITING") return null;
+  if (!ignoreMode && state.buyOrder) return null;
 
   const cooldownOK = Date.now() - state.lastExitTimeMs >= COOLDOWN_MS;
   const metric = earlyArmMetric();
@@ -2587,6 +2671,7 @@ function buildEarlyArmSignal(ignoreMode = false) {
     breakdownLockOK: breakdownGate.ok,
     priceLadderOK: entryZone.ladder.ok,
     rangePosition24hOK: entryZone.range.ok,
+    positionSpacingOK: positionSpacingContext(buyPrice).ok,
     cooldownOK,
     buyBelowMarketOK:
       distanceToBuy !== null &&
@@ -2625,13 +2710,32 @@ function buildEarlyArmSignal(ignoreMode = false) {
 // ============================================================
 
 function placeBuyLimit(signal, placementContext = null) {
+  if (state.buyOrder) return false; // una sola BUY pendiente a la vez
+
   const now = Date.now();
   const price = signal.buyPrice;
   const allocation = scalpAllocation(signal);
   const capitalToUse = allocation.capital;
+  const spacing = positionSpacingContext(price);
+
+  if (!spacing.ok) {
+    state.positionSpacingBlocks = (state.positionSpacingBlocks || 0) + 1;
+    logEvent("↔️ BUY BLOCKED BY POSITION SPACING", {
+      requestedPrice: price,
+      target: signal.target,
+      minimumSpacing: pct(MIN_POSITION_SPACING_PCT),
+      nearestEntry: spacing.nearestEntry,
+      nearestDistance: pct(spacing.nearestDistancePct),
+      nearestPositionId: spacing.nearestPositionId,
+      nearestType: spacing.nearestType,
+      action: "WAIT_FOR_DISTINCT_SCALP_LEVEL"
+    });
+    saveState();
+    return false;
+  }
 
   if (!allocation.zone.ok) {
-    logEvent("🚫 BUY BLOCKED BY V5.1.8.2 ENTRY ZONE", {
+    logEvent("🚫 BUY BLOCKED BY V5.1.8.3 ENTRY ZONE", {
       requestedPrice: price,
       target: signal.target,
       rangeMode: allocation.zone.range.mode,
@@ -2645,9 +2749,7 @@ function placeBuyLimit(signal, placementContext = null) {
     return false;
   }
 
-  if (!Number.isFinite(capitalToUse) || capitalToUse < MIN_SCALP_CASH_USDT) {
-    return false;
-  }
+  if (!Number.isFinite(capitalToUse) || capitalToUse < MIN_SCALP_CASH_USDT) return false;
 
   const requestedPearl = capitalToUse / price;
   const queueAhead = bookAmountAt(bids, price);
@@ -2656,33 +2758,28 @@ function placeBuyLimit(signal, placementContext = null) {
     firstPlacedAt: iso(now),
     firstPlacedAtMs: now,
     ...placementCausalityFields(placementContext),
-
     entrySignalType: signal.type || "UNKNOWN",
     hardSignalConfirmedAt: signal.type === "HARD_SIGNAL" ? iso(now) : null,
     hardSignalConfirmedAtMs: signal.type === "HARD_SIGNAL" ? now : null,
-
     price,
     target: signal.target,
-
     cash: capitalToUse,
     allocationMode: allocation.mode,
     allocationFraction: allocation.fraction,
+    multiPositionSlotCap: allocation.slotCap,
     reserveAfterFill: allocation.reserveAfterFill,
     highRangeCaution: allocation.caution,
     entryZone: allocation.zone,
+    spacingAtPlacement: spacing,
     requestedPearl,
-
     queueAhead,
     qualifyingVolume: 0,
     requiredFlow: (queueAhead + requestedPearl) * FILL_SAFETY
   };
 
-  state.mode = "BUY_LIMIT";
+  syncLegacyScalpView();
   state.buyOrdersPlaced++;
-
-  if (signal.type === "EARLY_ARM") {
-    state.earlyBuyOrdersArmed = (state.earlyBuyOrdersArmed || 0) + 1;
-  }
+  if (signal.type === "EARLY_ARM") state.earlyBuyOrdersArmed = (state.earlyBuyOrdersArmed || 0) + 1;
   if (["HIGH_RANGE_CAUTION", "EXHAUSTION_CAUTION", "UPPER_RANGE_CAUTION"].includes(allocation.mode)) {
     state.highRangeCautionOrders = (state.highRangeCautionOrders || 0) + 1;
   }
@@ -2699,11 +2796,11 @@ function placeBuyLimit(signal, placementContext = null) {
   });
 
   console.log(signal.type === "EARLY_ARM" ? "\n🟡 EARLY BUY ARMED" : "\n🟡 BUY LIMIT", {
-    entrySignalType: signal.type,
-    price,
-    target: signal.target,
-    allocationMode: allocation.mode,
-    capitalToUse: num(capitalToUse),
+    entrySignalType: signal.type, price, target: signal.target,
+    allocationMode: allocation.mode, capitalToUse: num(capitalToUse),
+    multiPositionSlotCap: num(allocation.slotCap),
+    openScalpPositions: openScalpPositions().length,
+    minimumPositionSpacing: pct(MIN_POSITION_SPACING_PCT),
     capitalFraction: pct(allocation.fraction),
     cashReserveIfFilled: num(allocation.reserveAfterFill),
     highRangeExhaustionVotes: allocation.caution.exhaustionVotes,
@@ -2719,22 +2816,17 @@ function placeBuyLimit(signal, placementContext = null) {
     startupContextReady: signal.startupGate?.ready ?? null,
     startupElapsedSeconds: num(signal.startupGate?.elapsedSeconds, 1),
     startupLiveTrades: signal.startupGate?.liveTrades ?? null,
-    lastPrice: signal.metric.current,
-    recentLow: signal.metric.low,
+    lastPrice: signal.metric.current, recentLow: signal.metric.low,
     support60m: num(signal.supportContext.support?.price, 4),
     supportTouches60m: signal.supportContext.support?.touches ?? null,
-    low24h: num(signal.ticker24h?.low, 4),
-    high24h: num(signal.ticker24h?.high, 4),
+    low24h: num(signal.ticker24h?.low, 4), high24h: num(signal.ticker24h?.high, 4),
     rangePosition24h: pct(tickerRangePosition24h(signal.metric.current)),
     targetSeenRecentlyAdvisory: signal.targetSeenRecentlyAdvisory,
     distanceToBuy: pct(signal.distanceToBuy),
     marketReferenceSource: signal.marketReferenceSource ?? null,
     marketSampleCount: signal.marketSampleCount ?? null,
-    failedHardConditionsAtArm: signal.type === "EARLY_ARM"
-      ? (buildHardSignal(true)?.failedConditions ?? null)
-      : [],
-    askShare5m: pct(signal.flow.askShare),
-    bidShare5m: pct(signal.flow.bidShare)
+    failedHardConditionsAtArm: signal.type === "EARLY_ARM" ? (buildHardSignal(true)?.failedConditions ?? null) : [],
+    askShare5m: pct(signal.flow.askShare), bidShare5m: pct(signal.flow.bidShare)
   });
 
   saveState();
@@ -2760,13 +2852,13 @@ function cancelBuy(reason) {
   }
 
   state.buyOrder = null;
-  state.mode = "WAITING";
+  syncLegacyScalpView();
 
   saveState();
 }
 
 // ============================================================
-// V5.1.8.2 — STATIC EARLY-ARM BUY / NO REPRICE UP
+// V5.1.8.3 — STATIC EARLY-ARM BUY / NO REPRICE UP
 // ============================================================
 
 // La entrada anticipada se mantiene estática durante 90 s.
@@ -2780,6 +2872,19 @@ function cancelBuy(reason) {
 function fillBuy(fillMeta = {}) {
   const order = state.buyOrder;
   if (!order) return;
+
+  const spacing = positionSpacingContext(order.price);
+  if (!spacing.ok) {
+    state.positionSpacingBlocks = (state.positionSpacingBlocks || 0) + 1;
+    logEvent("↔️ BUY FILL ABORTED BY POSITION SPACING", {
+      orderPrice: order.price,
+      nearestEntry: spacing.nearestEntry,
+      nearestDistance: pct(spacing.nearestDistancePct),
+      nearestPositionId: spacing.nearestPositionId
+    });
+    cancelBuy("POSITION_SPACING_RELOCKED");
+    return;
+  }
 
   const capital = order.cash;
   if (!Number.isFinite(capital) || capital <= 0 || state.cash + 1e-9 < capital) {
@@ -2795,12 +2900,35 @@ function fillBuy(fillMeta = {}) {
   const grossPearl = capital / order.price;
   const buyFeePearl = grossPearl * BUY_FEE;
   const pearlReceived = grossPearl - buyFeePearl;
-
   const sellTarget = roundUp(order.price * (1 + TARGET_GROSS));
   const downsideSupport = downsideSupportForEntry(order.price);
   const entryNow = Date.now();
 
-  state.position = {
+  state.scalpPositionsOpened = (state.scalpPositionsOpened || 0) + 1;
+  const positionId = `scalp-${entryNow}-${state.scalpPositionsOpened}`;
+
+  const queueAhead = bookAmountAt(asks, sellTarget);
+  const sellPlacedAtMs = Date.now();
+  const sellPlacementContext = {
+    batchId: fillMeta.tradeObservationBatchId ?? null,
+    tradeTimeMs: fillMeta.tradeExchangeTimeMs ?? null,
+    source: fillMeta.tradeSource ?? null
+  };
+
+  const sellOrder = {
+    positionId,
+    placedAt: iso(sellPlacedAtMs),
+    placedAtMs: sellPlacedAtMs,
+    ...placementCausalityFields(sellPlacementContext),
+    price: sellTarget,
+    pearl: pearlReceived,
+    queueAhead,
+    qualifyingVolume: 0,
+    requiredFlow: (queueAhead + pearlReceived) * FILL_SAFETY
+  };
+
+  const position = {
+    id: positionId,
     entryTime: iso(entryNow),
     entryTimeMs: entryNow,
     entryPrice: order.price,
@@ -2815,6 +2943,7 @@ function fillBuy(fillMeta = {}) {
     buyFeePearl,
     pearlReceived,
     sellTarget,
+    sellOrder,
     structuralSupportAtEntry: downsideSupport.price,
     structuralSupportSource: downsideSupport.source,
     structuralSupportTouches: downsideSupport.touches,
@@ -2830,88 +2959,43 @@ function fillBuy(fillMeta = {}) {
   };
 
   state.cash = Math.max(0, state.cash - capital);
-  state.pearl = pearlReceived;
+  state.scalpPositions.push(position);
   state.buyOrdersFilled++;
   state.buyOrder = null;
-
-  const queueAhead = bookAmountAt(asks, sellTarget);
-  const sellPlacedAtMs = Date.now();
-  const sellPlacementContext = {
-    batchId: fillMeta.tradeObservationBatchId ?? null,
-    tradeTimeMs: fillMeta.tradeExchangeTimeMs ?? null,
-    source: fillMeta.tradeSource ?? null
-  };
-
-  state.sellOrder = {
-    placedAt: iso(sellPlacedAtMs),
-    placedAtMs: sellPlacedAtMs,
-    ...placementCausalityFields(sellPlacementContext),
-    price: sellTarget,
-    pearl: pearlReceived,
-    queueAhead,
-    qualifyingVolume: 0,
-    requiredFlow: (queueAhead + pearlReceived) * FILL_SAFETY
-  };
-
-  state.mode = "SELL_LIMIT";
   state.sellOrdersPlaced = (state.sellOrdersPlaced || 0) + 1;
+  syncLegacyScalpView();
 
   append(TRADES_FILE, {
-    type: "PAPER_BUY_FILLED",
-    time: iso(),
-    localTime: localClock().text,
-    entryPrice: order.price,
-    investedUSDT: capital,
-    allocationMode: order.allocationMode || "NORMAL_SCALP",
-    allocationFraction: order.allocationFraction ?? 1,
-    cashReserveAfterFill: num(state.cash),
-    grossPearl: num(grossPearl),
-    buyFeePearl: num(buyFeePearl),
-    pearlReceived: num(pearlReceived),
-    sellTarget,
-    structuralSupportAtEntry: downsideSupport.price,
-    structuralSupportSource: downsideSupport.source,
-    low24hAtEntry: ticker24h?.low ?? null,
-    high24hAtEntry: ticker24h?.high ?? null,
-    fillMethod: fillMeta.method || null,
-    fillTriggerTradePrice: fillMeta.tradePrice ?? null,
-    fillTriggerTradeSide: fillMeta.tradeSide ?? null,
-    fillTriggerTradeSource: fillMeta.tradeSource ?? null,
-    fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null,
-    fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null,
-    fillCausalAgeMs: fillMeta.causalAgeMs ?? null,
-    sellOrderPlacedAt: state.sellOrder.placedAt
+    type: "PAPER_BUY_FILLED", time: iso(), localTime: localClock().text, positionId,
+    entryPrice: order.price, investedUSDT: capital, allocationMode: order.allocationMode || "NORMAL_SCALP",
+    allocationFraction: order.allocationFraction ?? 1, cashReserveAfterFill: num(state.cash),
+    grossPearl: num(grossPearl), buyFeePearl: num(buyFeePearl), pearlReceived: num(pearlReceived),
+    sellTarget, structuralSupportAtEntry: downsideSupport.price, structuralSupportSource: downsideSupport.source,
+    low24hAtEntry: ticker24h?.low ?? null, high24hAtEntry: ticker24h?.high ?? null,
+    fillMethod: fillMeta.method || null, fillTriggerTradePrice: fillMeta.tradePrice ?? null,
+    fillTriggerTradeSide: fillMeta.tradeSide ?? null, fillTriggerTradeSource: fillMeta.tradeSource ?? null,
+    fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null, fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null,
+    fillCausalAgeMs: fillMeta.causalAgeMs ?? null, sellOrderPlacedAt: sellOrder.placedAt
   });
 
   console.log("\n🟢 BUY FILLED", {
-    entry: order.price,
-    entrySignalType: order.entrySignalType || null,
-    hardSignalConfirmedBeforeFill: Boolean(order.hardSignalConfirmedAt),
-    target045: sellTarget,
-    pearlReceived: num(pearlReceived),
-    supportAtEntry: num(downsideSupport.price, 4),
-    supportSource: downsideSupport.source,
-    low24hAtEntry: num(ticker24h?.low, 4),
-    high24hAtEntry: num(ticker24h?.high, 4),
-    capital,
-    fillMethod: fillMeta.method || null,
-    fillTriggerTradePrice: fillMeta.tradePrice ?? null,
-    fillTriggerTradeSide: fillMeta.tradeSide ?? null,
-    fillTriggerTradeSource: fillMeta.tradeSource ?? null,
-    fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null,
-    fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null,
-    fillCausalAgeMs: fillMeta.causalAgeMs ?? null
+    positionId, entry: order.price, entrySignalType: order.entrySignalType || null,
+    hardSignalConfirmedBeforeFill: Boolean(order.hardSignalConfirmedAt), target045: sellTarget,
+    pearlReceived: num(pearlReceived), supportAtEntry: num(downsideSupport.price, 4),
+    supportSource: downsideSupport.source, low24hAtEntry: num(ticker24h?.low, 4),
+    high24hAtEntry: num(ticker24h?.high, 4), capital, cashRemaining: num(state.cash),
+    openScalpPositions: openScalpPositions().length, fillMethod: fillMeta.method || null,
+    fillTriggerTradePrice: fillMeta.tradePrice ?? null, fillTriggerTradeSide: fillMeta.tradeSide ?? null,
+    fillTriggerTradeSource: fillMeta.tradeSource ?? null, fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null,
+    fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null, fillCausalAgeMs: fillMeta.causalAgeMs ?? null
   });
 
   logEvent("🟠 SELL LIMIT PLACED", {
-    orderPrice: state.sellOrder.price,
-    pearl: num(state.sellOrder.pearl),
-    queueAhead: num(state.sellOrder.queueAhead),
-    requiredFlow: num(state.sellOrder.requiredFlow),
-    placedAt: state.sellOrder.placedAt,
-    placedInObservationBatchId: state.sellOrder.placedInObservationBatchId,
-    placedAfterTradeExchangeTime: state.sellOrder.placedAfterTradeExchangeTime,
-    placementObservationSource: state.sellOrder.placementObservationSource,
+    positionId, orderPrice: sellOrder.price, pearl: num(sellOrder.pearl),
+    queueAhead: num(sellOrder.queueAhead), requiredFlow: num(sellOrder.requiredFlow),
+    placedAt: sellOrder.placedAt, placedInObservationBatchId: sellOrder.placedInObservationBatchId,
+    placedAfterTradeExchangeTime: sellOrder.placedAfterTradeExchangeTime,
+    placementObservationSource: sellOrder.placementObservationSource,
     rule: "ONLY_TRADES_OBSERVED_AFTER_THIS_ORDER_MAY_FILL"
   });
 
@@ -2947,26 +3031,23 @@ function currentEquity() {
 // CLOSE POSITION
 // ============================================================
 
-function finalizeSell({ reason, sellPrice, finalUSDT, market, fillMeta = {} }) {
-  const position = state.position;
-  if (!position) return;
+function finalizeSell(positionId, { reason, sellPrice, finalUSDT, market, fillMeta = {} }) {
+  const index = openScalpPositions().findIndex((p) => p.id === positionId);
+  if (index < 0) return false;
 
+  const position = state.scalpPositions[index];
+  const sellOrder = position.sellOrder || null;
   const capitalBefore = position.investedUSDT;
   const profit = finalUSDT - capitalBefore;
   const roi = profit / capitalBefore;
   const holdSeconds = (Date.now() - position.entryTimeMs) / 1000;
 
   state.cash += finalUSDT;
-  state.pearl = 0;
-
+  state.scalpPositions.splice(index, 1);
   state.cycles++;
   state.sellOrdersFilled++;
-
   state.realizedProfit = (Number(state.realizedProfit) || 0) + profit;
-  state.peakRealizedProfit = Math.max(
-    Number(state.peakRealizedProfit) || 0,
-    state.realizedProfit
-  );
+  state.peakRealizedProfit = Math.max(Number(state.peakRealizedProfit) || 0, state.realizedProfit);
   state.lastExitTimeMs = Date.now();
 
   if (reason === "TARGET_0.45") state.targetExits++;
@@ -2975,63 +3056,33 @@ function finalizeSell({ reason, sellPrice, finalUSDT, market, fillMeta = {} }) {
     state.capitalProtectedStops++;
   }
 
-
   const row = {
-    type: "PAPER_SELL_FILLED",
-    reason,
-    market,
-
-    time: iso(),
-    localTime: localClock().text,
-
-    cycle: state.cycles,
-
-    entryPrice: position.entryPrice,
-    sellPrice: num(sellPrice, 6),
-
-    grossMove: pct(sellPrice / position.entryPrice - 1),
-    cycleROI: pct(roi),
-
-    holdSeconds: num(holdSeconds, 2),
-
-    capitalBefore: num(capitalBefore),
-    capitalAfter: num(finalUSDT),
-    cycleProfit: num(profit),
-    totalProfit: num(state.realizedProfit),
-    fillMethod: fillMeta.method || null,
-    fillTriggerTradePrice: fillMeta.tradePrice ?? null,
-    fillTriggerTradeSide: fillMeta.tradeSide ?? null,
-    fillTriggerTradeSource: fillMeta.tradeSource ?? null,
-    fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null,
-    fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null,
-    causalAgeMs: fillMeta.causalAgeMs ?? null,
-    exchangeAgeVsOrderMs: fillMeta.exchangeAgeVsOrderMs ?? null,
-    sellOrderPlacedAt: state.sellOrder?.placedAt ?? null
+    type: "PAPER_SELL_FILLED", reason, market, time: iso(), localTime: localClock().text,
+    cycle: state.cycles, positionId, entryPrice: position.entryPrice, sellPrice: num(sellPrice, 6),
+    grossMove: pct(sellPrice / position.entryPrice - 1), cycleROI: pct(roi), holdSeconds: num(holdSeconds, 2),
+    capitalBefore: num(capitalBefore), capitalAfter: num(finalUSDT), cycleProfit: num(profit),
+    totalProfit: num(state.realizedProfit), fillMethod: fillMeta.method || null,
+    fillTriggerTradePrice: fillMeta.tradePrice ?? null, fillTriggerTradeSide: fillMeta.tradeSide ?? null,
+    fillTriggerTradeSource: fillMeta.tradeSource ?? null, fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null,
+    fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null, causalAgeMs: fillMeta.causalAgeMs ?? null,
+    exchangeAgeVsOrderMs: fillMeta.exchangeAgeVsOrderMs ?? null, sellOrderPlacedAt: sellOrder?.placedAt ?? null
   };
 
   append(TRADES_FILE, row);
-
   console.log("\n💰 POSITION CLOSED", row);
-
-  state.position = null;
-  state.sellOrder = null;
-  state.mode = "WAITING";
-
+  syncLegacyScalpView();
   saveState();
+  return true;
 }
 
-// ============================================================
-// NORMAL TARGET +0.45%
-// ============================================================
+function normalTargetSell(positionId, fillMeta = {}) {
+  const position = openScalpPositions().find((p) => p.id === positionId);
+  const sell = position?.sellOrder;
+  if (!position || !sell) return false;
 
-function normalTargetSell(fillMeta = {}) {
-  const sell = state.sellOrder;
-  if (!sell) return;
-
-  const grossUSDT = state.pearl * sell.price;
+  const grossUSDT = position.pearlReceived * sell.price;
   const finalUSDT = grossUSDT * (1 - SELL_FEE);
-
-  finalizeSell({
+  return finalizeSell(positionId, {
     reason: "TARGET_0.45",
     sellPrice: sell.price,
     finalUSDT,
@@ -3041,64 +3092,45 @@ function normalTargetSell(fillMeta = {}) {
 }
 
 // ============================================================
-// PROTECTED MARKET EXIT — V4.8
+// PROTECTED MARKET EXIT — V4.8 (POR POSICIÓN)
 // ============================================================
 
 let lastCapitalFloorBlockLogMs = 0;
 
-function protectedMarketExit(reason) {
-  if (state.mode !== "SELL_LIMIT" || !state.position) {
-    return false;
-  }
+function protectedMarketExit(positionId, reason) {
+  const position = openScalpPositions().find((p) => p.id === positionId);
+  if (!position) return false;
 
-  const simulated = simulateMarketSell(state.pearl);
-
+  const simulated = simulateMarketSell(position.pearlReceived);
   if (!simulated) {
-    logEvent("⚠️ PROTECTED EXIT FAILED", {
-      reason,
-      detail: "INSUFFICIENT_VISIBLE_BID_DEPTH"
-    });
-
+    logEvent("⚠️ PROTECTED EXIT FAILED", { positionId, reason, detail: "INSUFFICIENT_VISIBLE_BID_DEPTH" });
     return false;
   }
 
-  const floor = protectedCapitalFloor();
+  const floor = protectedCapitalFloor(position);
   const wouldReceive = simulated.netUSDT;
-
-  // Regla central V4.8:
-  // una salida DEFENSIVA nunca puede realizar capital por debajo del piso.
   if (wouldReceive + 1e-9 < floor) {
     const now = Date.now();
-
-    // Evita imprimir cientos de veces por segundo la misma protección.
     if (now - lastCapitalFloorBlockLogMs >= 30000) {
       lastCapitalFloorBlockLogMs = now;
       state.capitalFloorBlockedStops++;
-
       logEvent("🛡️ STOP BLOCKED BY CAPITAL FLOOR", {
-        reason,
-        entryPrice: state.position.entryPrice,
-        estimatedSellPrice: num(simulated.avgPrice, 6),
-        estimatedNetUSDT: num(wouldReceive),
-        protectedCapitalFloor: num(floor),
-        amountBelowFloor: num(floor - wouldReceive),
+        positionId, reason, entryPrice: position.entryPrice,
+        estimatedSellPrice: num(simulated.avgPrice, 6), estimatedNetUSDT: num(wouldReceive),
+        protectedCapitalFloor: num(floor), amountBelowFloor: num(floor - wouldReceive),
         action: "HOLD_POSITION"
       });
-
       saveState();
     }
-
     return false;
   }
 
-  finalizeSell({
+  return finalizeSell(positionId, {
     reason: "CAPITAL_PROTECTED_STOP",
     sellPrice: simulated.avgPrice,
     finalUSDT: simulated.netUSDT,
     market: true
   });
-
-  return true;
 }
 
 function recoveryTargetPrice(position) {
@@ -3109,10 +3141,11 @@ function recoveryTargetPrice(position) {
   return roundUp(exactBreakEven * (1 + RECOVERY_EXIT_BUFFER_PCT));
 }
 
-function moveActivePositionToRecovery(reason, placementContext = null) {
-  if (state.mode !== "SELL_LIMIT" || !state.position) return false;
+function moveActivePositionToRecovery(positionId, reason, placementContext = null) {
+  const positionIndex = openScalpPositions().findIndex((p) => p.id === positionId);
+  if (positionIndex < 0) return false;
 
-  const position = state.position;
+  const position = state.scalpPositions[positionIndex];
   const support = position.structuralSupportAtEntry;
   const breakPrice = Number.isFinite(support)
     ? support * (1 - STRUCTURAL_STOP_BREAK_PCT)
@@ -3120,7 +3153,7 @@ function moveActivePositionToRecovery(reason, placementContext = null) {
   const target = recoveryTargetPrice(position);
   const recoveryId = `recovery-${Date.now()}-${state.recoveryHoldsStarted + 1}`;
 
-  // V5.1.8.2 — ANCLA INMUTABLE DEL SOPORTE 24H.
+  // V5.1.8.3 — ANCLA INMUTABLE DEL SOPORTE 24H.
   // Preferimos el low24h vigente EXACTAMENTE cuando nace el recovery.
   // Si el ticker no está disponible, usamos el low24h capturado en la entrada.
   const currentLow24h = Number(ticker24h?.low);
@@ -3193,11 +3226,9 @@ function moveActivePositionToRecovery(reason, placementContext = null) {
     recoveryId
   });
 
-  // Sacamos esta posición del motor de scalp SIN venderla.
-  state.position = null;
-  state.sellOrder = null;
-  state.pearl = 0;
-  state.mode = "WAITING";
+  // Sacamos SOLO esta posición del motor de scalp SIN venderla.
+  state.scalpPositions.splice(positionIndex, 1);
+  syncLegacyScalpView();
   state.lastExitTimeMs = Date.now();
 
   const fallingLock = activateFallingMarketLock({
@@ -3208,6 +3239,7 @@ function moveActivePositionToRecovery(reason, placementContext = null) {
 
   logEvent("🧊 POSITION MOVED TO RECOVERY_HOLD", {
     recoveryId,
+    sourcePositionId: positionId,
     reason,
     entryPrice: position.entryPrice,
     investedUSDT: num(position.investedUSDT),
@@ -3246,6 +3278,7 @@ function moveActivePositionToRecovery(reason, placementContext = null) {
     time: iso(),
     localTime: localClock().text,
     recoveryId,
+    sourcePositionId: positionId,
     reason,
     entryPrice: position.entryPrice,
     investedUSDT: num(position.investedUSDT),
@@ -3574,10 +3607,10 @@ function checkRecoveryHardStops() {
 // RISK EXIT — SIN HORARIOS
 // ============================================================
 
-function maybeRiskExit(placementContext = null) {
-  if (state.mode !== "SELL_LIMIT" || !state.position) return false;
+function maybeRiskExit(positionId, placementContext = null) {
+  const position = openScalpPositions().find((p) => p.id === positionId);
+  if (!position) return false;
 
-  const position = state.position;
   const bid = bestBid();
   if (!bid) return false;
 
@@ -3587,38 +3620,28 @@ function maybeRiskExit(placementContext = null) {
   const momentum30s = priceMomentum(now, FAST_FLOW_WINDOW_MS);
   const holdMs = now - position.entryTimeMs;
   const priceMove = bid / position.entryPrice - 1;
-
-  // 1) RUPTURA ESTRUCTURAL CONFIRMADA.
-  // V5.1.8.2: NO vende. Migra la posición a RECOVERY_HOLD y crea
-  // BREAKDOWN_LOCK para impedir recomprar de inmediato el mismo soporte.
   const support = position.structuralSupportAtEntry;
 
   if (holdMs >= STOP_MIN_HOLD_MS && Number.isFinite(support) && support > 0) {
     const structuralBreakPrice = support * (1 - STRUCTURAL_STOP_BREAK_PCT);
-
     const confirmed =
       bid <= structuralBreakPrice &&
-      flow5m.askShare !== null &&
-      flow5m.askShare >= STOP_ASK_SHARE &&
-      flow30s.askShare !== null &&
-      flow30s.askShare >= STRUCTURAL_STOP_FAST_ASK_SHARE &&
-      momentum30s.move !== null &&
-      momentum30s.move <= -STRUCTURAL_STOP_MIN_DROP_30S;
+      flow5m.askShare !== null && flow5m.askShare >= STOP_ASK_SHARE &&
+      flow30s.askShare !== null && flow30s.askShare >= STRUCTURAL_STOP_FAST_ASK_SHARE &&
+      momentum30s.move !== null && momentum30s.move <= -STRUCTURAL_STOP_MIN_DROP_30S;
 
     if (confirmed) {
-      return moveActivePositionToRecovery("CONFIRMED_SUPPORT_BREAK", placementContext);
+      return moveActivePositionToRecovery(positionId, "CONFIRMED_SUPPORT_BREAK", placementContext);
     }
   }
 
-  // 2) STOP DEFENSIVO NORMAL. Puede gastar ganancias acumuladas,
-  // pero NO puede atravesar el capital floor.
   if (
     holdMs >= STOP_MIN_HOLD_MS &&
     flow5m.askShare !== null &&
     flow5m.askShare >= STOP_ASK_SHARE &&
     priceMove <= -STOP_PRICE_DROP
   ) {
-    return protectedMarketExit("SELL_PRESSURE");
+    return protectedMarketExit(positionId, "SELL_PRESSURE");
   }
 
   return false;
@@ -3671,7 +3694,7 @@ function maybeMark24hComplete() {
   state.test24hCompletedAt = iso();
 
   const summary = {
-    version: "5.1.8.2",
+    version: "5.1.8.3",
     testStartedAt: state.testStartedAt,
     testCompletedAt: state.test24hCompletedAt,
     elapsedHours: timing.elapsedHours,
@@ -3725,6 +3748,10 @@ function maybeMark24hComplete() {
     maxDrawdown: state.maxDrawdown,
 
     openPosition: state.position,
+    openPositions: openScalpPositions(),
+    openScalpPositionCount: openScalpPositions().length,
+    positionSpacingBlocks: state.positionSpacingBlocks || 0,
+    minimumPositionSpacingPct: MIN_POSITION_SPACING_PCT,
     pendingBuy: state.buyOrder,
     openRecoveries: state.recoveryPositions
   };
@@ -3768,7 +3795,7 @@ function maybeReady() {
   if (!liveReady && gotDepthSnapshot && (gotTradesSnapshot || gotLiveTrade || tradesRestBootstrapped)) {
     liveReady = true;
 
-    logEvent("✅ V5.1.8.2 READY", {
+    logEvent("✅ V5.1.8.3 READY", {
       historyTrades: recentTrades.length,
       bestBid: bestBid(),
       bestAsk: bestAsk(),
@@ -3832,33 +3859,23 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
   recentTrades.sort((a, b) => a.time - b.time);
   trimHistory(trade.time);
 
-  // V5.1.8.2: el warm-up usa SOLO trades live del proceso actual.
-  // Tras 4 minutos, una caída activa puede crear FALLING_MARKET_LOCK incluso
-  // ANTES de que exista una posición atrapada.
   const preEntryLockCreated = maybeActivatePreEntryFallingLock(trade.price);
-  if (preEntryLockCreated && state.mode === "BUY_LIMIT" && state.buyOrder) {
+  if (preEntryLockCreated && state.buyOrder) {
     cancelBuy("PREENTRY_HARD_FALLING_MARKET_LOCK");
   }
 
-  // SOLO trades live/causales actualizan/liberan el lock de caída.
   updateFallingMarketLock(trade.price);
-
-  // Recovery corre en paralelo al único scalp activo.
   updateBreakdownLocks(trade.price);
   processRecoveryTrade(trade, source, observationMeta);
   checkRecoveryHardStops();
 
   // ==========================================================
-  // BUY LIMIT PENDING
+  // ÚNICA BUY LIMIT PENDIENTE — puede coexistir con varias SELL.
   // ==========================================================
-
-  if (state.mode === "BUY_LIMIT" && state.buyOrder) {
+  if (state.buyOrder) {
     const order = state.buyOrder;
     const causal = causalFillAudit(order, trade, source, observationMeta);
 
-    // Un trade visto antes (o en el mismo lote que creó la orden) puede
-    // actualizar historial/métricas, pero NO puede confirmar, cancelar ni llenar
-    // una orden que todavía no existía cuando ese lote fue recibido.
     if (!causal.ok) {
       const relation = priceRelation(trade.price, order.price);
       if (relation < 0 || (relation === 0 && trade.side === "ASK")) {
@@ -3870,214 +3887,199 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
           ...causal
         });
       }
-      return;
-    }
+    } else {
+      const pendingFalling = preEntryFallingContext(trade.price);
 
-    const pendingFalling = preEntryFallingContext(trade.price);
-    if (
-      pendingFalling.softCaution &&
-      Number(order.allocationFraction || 1) > SOFT_FALLING_CAPITAL_FRACTION + 1e-9
-    ) {
-      logEvent("🟠 PENDING BUY RESIZED — SOFT FALLING CAUTION", {
-        orderPrice: order.price,
-        target: order.target,
-        tradePrice: trade.price,
-        previousAllocationFraction: pct(order.allocationFraction || 1),
-        nextAllocationFraction: pct(SOFT_FALLING_CAPITAL_FRACTION),
-        move4m: pct(pendingFalling.move4m),
-        move5m: pct(pendingFalling.move5m),
-        move10m: pct(pendingFalling.move10m),
-        action: "CANCEL_AND_REARM_AT_30PCT"
-      });
-      cancelBuy("SOFT_FALLING_CAUTION_RESIZE");
-      // Permitimos que el mismo trade continúe hasta WAITING; cualquier nueva
-      // orden creada en este batch queda protegida por la causalidad estricta.
-      return;
-    }
-
-    const pendingZone = entryZoneContext(order.price, earlyArmMetric());
-    if (!pendingZone.ok) {
-      logEvent("🚫 PENDING BUY CANCELLED BY V5.1.8.2 ENTRY ZONE", {
-        orderPrice: order.price,
-        target: order.target,
-        high24h: pendingZone.ladder.high24h,
-        maxBuyExclusive: pendingZone.ladder.maxBuyExclusive,
-        nextUnlockResistance: pendingZone.ladder.nextUnlockResistance,
-        rangePosition24h: pendingZone.range.rangePosition24h,
-        rangeMode: pendingZone.range.mode,
-        ladderReason: pendingZone.ladder.reason,
-        rangeReason: pendingZone.range.reason
-      });
-      cancelBuy("ENTRY_ZONE_RELOCKED");
-      return;
-    }
-
-    // V5.1.8.2: la LIMIT se arma apenas existe una zona maker válida.
-    // Puede llenarse ANTES de que exista la señal dura. Si la señal completa
-    // aparece mientras ya estamos en el libro, solo la registramos:
-    // NO mueve la orden, NO reinicia TTL y NO es requisito para fill.
-    if (!order.hardSignalConfirmedAt) {
-      const hardSignalNow = buildHardSignal(true);
-
-      if (hardSignalNow?.ok) {
-        order.hardSignalConfirmedAt = iso();
-        order.hardSignalConfirmedAtMs = Date.now();
-        state.hardSignalsConfirmedWhileArmed =
-          (state.hardSignalsConfirmedWhileArmed || 0) + 1;
-
-        logEvent("✅ HARD SIGNAL CONFIRMED WHILE ARMED", {
+      if (
+        pendingFalling.softCaution &&
+        Number(order.allocationFraction || 1) > SOFT_FALLING_CAPITAL_FRACTION + 1e-9
+      ) {
+        logEvent("🟠 PENDING BUY RESIZED — SOFT FALLING CAUTION", {
           orderPrice: order.price,
           target: order.target,
-          orderAgeSeconds: num(
-            (Date.now() - order.firstPlacedAtMs) / 1000,
-            2
-          ),
-          marketPrice: trade.price,
-          tradeExchangeTime: causal.tradeExchangeTime,
-          tradeObservedAt: causal.tradeObservedAt,
-          causalAgeMs: causal.causalAgeMs,
-          hardConditions: hardSignalNow.conditions
-        });
-      }
-    }
-
-    // TTL se comprueba ANTES de permitir que este trade llene
-    // una orden que ya debería haber expirado.
-    if (Date.now() - order.firstPlacedAtMs >= BUY_TTL_MS) {
-      cancelBuy("TTL_EXPIRED");
-      return;
-    }
-
-    // V5.1.8.2 — FILL REALISTA DE LIMIT MAKER.
-    // 1) Si un trade causal atraviesa nuestra BUY (trade < LIMIT), FULL FILL.
-    // 2) Si ocurre exactamente en la LIMIT, respeta cola + tamaño propio.
-    const buyRelation = priceRelation(trade.price, order.price);
-
-    if (buyRelation < 0) {
-      logEvent("⚡ BUY CROSS-THROUGH FILL", {
-        orderPrice: order.price,
-        tradePrice: trade.price,
-        tradeSide: trade.side,
-        tradeSource: source,
-        queueAhead: order.queueAhead,
-        qualifyingVolumeBeforeFill: order.qualifyingVolume,
-        orderPlacedAt: causal.orderPlacedAt,
-        tradeExchangeTime: causal.tradeExchangeTime,
-        tradeObservedAt: causal.tradeObservedAt,
-        causalAgeMs: causal.causalAgeMs,
-        exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
-      });
-
-      fillBuy({
-        method: "CROSS_THROUGH",
-        tradePrice: trade.price,
-        tradeSide: trade.side,
-        tradeSource: source,
-        tradeExchangeTime: causal.tradeExchangeTime,
-        tradeExchangeTimeMs: causal.tradeExchangeTimeMs,
-        tradeObservedAt: causal.tradeObservedAt,
-        tradeObservationBatchId: causal.batchId,
-        causalAgeMs: causal.causalAgeMs,
-        exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
-      });
-      return;
-    }
-
-    if (
-      buyRelation === 0 &&
-      trade.side === "ASK"
-    ) {
-      order.qualifyingVolume += trade.amount;
-
-      if (order.qualifyingVolume >= order.requiredFlow) {
-        fillBuy({
-          method: "AT_LIMIT_QUEUE_CONSUMED",
           tradePrice: trade.price,
-          tradeSide: trade.side,
-          tradeSource: source,
-          tradeExchangeTime: causal.tradeExchangeTime,
-          tradeExchangeTimeMs: causal.tradeExchangeTimeMs,
-          tradeObservedAt: causal.tradeObservedAt,
-          tradeObservationBatchId: causal.batchId,
-          causalAgeMs: causal.causalAgeMs,
-          exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
+          previousAllocationFraction: pct(order.allocationFraction || 1),
+          nextAllocationFraction: pct(SOFT_FALLING_CAPITAL_FRACTION),
+          move4m: pct(pendingFalling.move4m),
+          move5m: pct(pendingFalling.move5m),
+          move10m: pct(pendingFalling.move10m),
+          action: "CANCEL_AND_REARM_AT_30PCT"
         });
-        return;
+        cancelBuy("SOFT_FALLING_CAUTION_RESIZE");
+      }
+
+      if (state.buyOrder) {
+        const pendingZone = entryZoneContext(order.price, earlyArmMetric());
+        const pendingSpacing = positionSpacingContext(order.price);
+
+        if (!pendingZone.ok || !pendingSpacing.ok) {
+          logEvent(
+            !pendingSpacing.ok
+              ? "↔️ PENDING BUY CANCELLED BY POSITION SPACING"
+              : "🚫 PENDING BUY CANCELLED BY V5.1.8.3 ENTRY ZONE",
+            {
+              orderPrice: order.price,
+              target: order.target,
+              nearestEntry: pendingSpacing.nearestEntry,
+              nearestDistance: pct(pendingSpacing.nearestDistancePct),
+              high24h: pendingZone.ladder.high24h,
+              maxBuyExclusive: pendingZone.ladder.maxBuyExclusive,
+              nextUnlockResistance: pendingZone.ladder.nextUnlockResistance,
+              rangePosition24h: pendingZone.range.rangePosition24h,
+              rangeMode: pendingZone.range.mode,
+              ladderReason: pendingZone.ladder.reason,
+              rangeReason: pendingZone.range.reason
+            }
+          );
+          cancelBuy(!pendingSpacing.ok ? "POSITION_SPACING_RELOCKED" : "ENTRY_ZONE_RELOCKED");
+        }
+      }
+
+      if (state.buyOrder) {
+        if (!order.hardSignalConfirmedAt) {
+          const hardSignalNow = buildHardSignal(true);
+          if (hardSignalNow?.ok) {
+            order.hardSignalConfirmedAt = iso();
+            order.hardSignalConfirmedAtMs = Date.now();
+            state.hardSignalsConfirmedWhileArmed =
+              (state.hardSignalsConfirmedWhileArmed || 0) + 1;
+
+            logEvent("✅ HARD SIGNAL CONFIRMED WHILE ARMED", {
+              orderPrice: order.price,
+              target: order.target,
+              orderAgeSeconds: num((Date.now() - order.firstPlacedAtMs) / 1000, 2),
+              marketPrice: trade.price,
+              tradeExchangeTime: causal.tradeExchangeTime,
+              tradeObservedAt: causal.tradeObservedAt,
+              causalAgeMs: causal.causalAgeMs,
+              hardConditions: hardSignalNow.conditions
+            });
+          }
+        }
+
+        if (Date.now() - order.firstPlacedAtMs >= BUY_TTL_MS) {
+          cancelBuy("TTL_EXPIRED");
+        }
+      }
+
+      if (state.buyOrder) {
+        const buyRelation = priceRelation(trade.price, order.price);
+
+        if (buyRelation < 0) {
+          logEvent("⚡ BUY CROSS-THROUGH FILL", {
+            orderPrice: order.price,
+            tradePrice: trade.price,
+            tradeSide: trade.side,
+            tradeSource: source,
+            queueAhead: order.queueAhead,
+            qualifyingVolumeBeforeFill: order.qualifyingVolume,
+            orderPlacedAt: causal.orderPlacedAt,
+            tradeExchangeTime: causal.tradeExchangeTime,
+            tradeObservedAt: causal.tradeObservedAt,
+            causalAgeMs: causal.causalAgeMs,
+            exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
+          });
+
+          fillBuy({
+            method: "CROSS_THROUGH",
+            tradePrice: trade.price,
+            tradeSide: trade.side,
+            tradeSource: source,
+            tradeExchangeTime: causal.tradeExchangeTime,
+            tradeExchangeTimeMs: causal.tradeExchangeTimeMs,
+            tradeObservedAt: causal.tradeObservedAt,
+            tradeObservationBatchId: causal.batchId,
+            causalAgeMs: causal.causalAgeMs,
+            exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
+          });
+        } else if (buyRelation === 0 && trade.side === "ASK") {
+          order.qualifyingVolume += trade.amount;
+
+          if (order.qualifyingVolume >= order.requiredFlow) {
+            fillBuy({
+              method: "AT_LIMIT_QUEUE_CONSUMED",
+              tradePrice: trade.price,
+              tradeSide: trade.side,
+              tradeSource: source,
+              tradeExchangeTime: causal.tradeExchangeTime,
+              tradeExchangeTimeMs: causal.tradeExchangeTimeMs,
+              tradeObservedAt: causal.tradeObservedAt,
+              tradeObservationBatchId: causal.batchId,
+              causalAgeMs: causal.causalAgeMs,
+              exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
+            });
+          }
+        }
+      }
+
+      if (state.buyOrder) {
+        const flow5m = flowMetrics();
+        const flow30s = flowMetrics(Date.now(), FAST_FLOW_WINDOW_MS);
+        const momentum30s = priceMomentum(Date.now(), FAST_FLOW_WINDOW_MS);
+        const orderAgeMs = Date.now() - order.firstPlacedAtMs;
+        const breakPrice = order.price * (1 - PENDING_BREAK_BELOW_BUY);
+        const distanceFromBuy = trade.price / order.price - 1;
+        const graceElapsed = orderAgeMs >= PENDING_CANCEL_GRACE_MS;
+        const materiallyBelowBuy = trade.price <= breakPrice;
+        const fastSellPressure =
+          flow30s.askShare !== null &&
+          flow30s.askShare >= PENDING_CANCEL_FAST_ASK_SHARE;
+        const fastPriceStillFalling =
+          momentum30s.move !== null &&
+          momentum30s.move <= -PENDING_CANCEL_MIN_DROP_30S;
+
+        if (
+          graceElapsed &&
+          materiallyBelowBuy &&
+          fastSellPressure &&
+          fastPriceStillFalling
+        ) {
+          logEvent("⚠️ BUY STRUCTURAL BREAK CONFIRMED", {
+            orderPrice: order.price,
+            breakPrice,
+            marketPrice: trade.price,
+            distanceFromBuy,
+            orderAgeSeconds: orderAgeMs / 1000,
+            askShare5m: flow5m.askShare,
+            bidShare5m: flow5m.bidShare,
+            askShare30s: flow30s.askShare,
+            bidShare30s: flow30s.bidShare,
+            priceMove30s: momentum30s.move
+          });
+
+          cancelBuy("STRUCTURAL_BREAK_BELOW_BUY");
+        }
       }
     }
-
-    // V5.1.8.2: una orden colocada para capturar un retroceso NO debe
-    // cancelarse simplemente porque el precio toque o atraviese unos ticks.
-    const flow5m = flowMetrics();
-    const flow30s = flowMetrics(Date.now(), FAST_FLOW_WINDOW_MS);
-    const momentum30s = priceMomentum(Date.now(), FAST_FLOW_WINDOW_MS);
-
-    const orderAgeMs = Date.now() - order.firstPlacedAtMs;
-    const breakPrice = order.price * (1 - PENDING_BREAK_BELOW_BUY);
-    const distanceFromBuy = trade.price / order.price - 1;
-
-    const graceElapsed = orderAgeMs >= PENDING_CANCEL_GRACE_MS;
-    const materiallyBelowBuy = trade.price <= breakPrice;
-    const fastSellPressure =
-      flow30s.askShare !== null &&
-      flow30s.askShare >= PENDING_CANCEL_FAST_ASK_SHARE;
-    const fastPriceStillFalling =
-      momentum30s.move !== null &&
-      momentum30s.move <= -PENDING_CANCEL_MIN_DROP_30S;
-
-    if (
-      graceElapsed &&
-      materiallyBelowBuy &&
-      fastSellPressure &&
-      fastPriceStillFalling
-    ) {
-      logEvent("⚠️ BUY STRUCTURAL BREAK CONFIRMED", {
-        orderPrice: order.price,
-        breakPrice,
-        marketPrice: trade.price,
-        distanceFromBuy,
-        orderAgeSeconds: orderAgeMs / 1000,
-        askShare5m: flow5m.askShare,
-        bidShare5m: flow5m.bidShare,
-        askShare30s: flow30s.askShare,
-        bidShare30s: flow30s.bidShare,
-        priceMove30s: momentum30s.move
-      });
-
-      cancelBuy("STRUCTURAL_BREAK_BELOW_BUY");
-      return;
-    }
-
-    return;
   }
 
   // ==========================================================
-  // POSITION OPEN / SELL LIMIT
+  // TODAS LAS SELL LIMIT ABIERTAS — independientes por posición.
   // ==========================================================
+  for (const position of [...openScalpPositions()]) {
+    const sell = position.sellOrder;
+    if (!sell) continue;
 
-  if (state.mode === "SELL_LIMIT" && state.sellOrder) {
-    const sell = state.sellOrder;
     const causal = causalFillAudit(sell, trade, source, observationMeta);
+    const sellRelation = priceRelation(trade.price, sell.price);
 
     if (!causal.ok) {
-      const relation = priceRelation(trade.price, sell.price);
-      if (relation > 0 || (relation === 0 && trade.side === "BID")) {
+      if (sellRelation > 0 || (sellRelation === 0 && trade.side === "BID")) {
         state.causalSellFillsBlocked = (state.causalSellFillsBlocked || 0) + 1;
         logEvent("⏱️ SELL FILL BLOCKED BY CAUSALITY", {
+          positionId: position.id,
           orderPrice: sell.price,
           tradePrice: trade.price,
           tradeSide: trade.side,
           ...causal
         });
       }
-      return;
+      continue;
     }
-
-    // V5.1.8.2 — target +0.45% con fill causal y cross-through.
-    const sellRelation = priceRelation(trade.price, sell.price);
 
     if (sellRelation > 0) {
       logEvent("⚡ SELL CROSS-THROUGH FILL", {
+        positionId: position.id,
         orderPrice: sell.price,
         tradePrice: trade.price,
         tradeSide: trade.side,
@@ -4091,7 +4093,7 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
         exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
       });
 
-      normalTargetSell({
+      normalTargetSell(position.id, {
         method: "CROSS_THROUGH",
         tradePrice: trade.price,
         tradeSide: trade.side,
@@ -4103,17 +4105,14 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
         causalAgeMs: causal.causalAgeMs,
         exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
       });
-      return;
+      continue;
     }
 
-    if (
-      sellRelation === 0 &&
-      trade.side === "BID"
-    ) {
+    if (sellRelation === 0 && trade.side === "BID") {
       sell.qualifyingVolume += trade.amount;
 
       if (sell.qualifyingVolume >= sell.requiredFlow) {
-        normalTargetSell({
+        normalTargetSell(position.id, {
           method: "AT_LIMIT_QUEUE_CONSUMED",
           tradePrice: trade.price,
           tradeSide: trade.side,
@@ -4125,38 +4124,28 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
           causalAgeMs: causal.causalAgeMs,
           exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
         });
-        return;
+        continue;
       }
     }
 
-    maybeRiskExit({
+    maybeRiskExit(position.id, {
       batchId: observationMeta?.batchId ?? null,
       tradeTimeMs: trade.time,
       source
     });
-    return;
   }
 
   // ==========================================================
-  // WAITING
+  // NUEVA BUY — mismas protecciones aunque existan SELL abiertas.
   // ==========================================================
-
-  if (state.mode === "WAITING" && state.cash >= MIN_SCALP_CASH_USDT) {
+  if (!state.buyOrder && state.cash >= MIN_SCALP_CASH_USDT) {
     const startup = startupContextStatus(trade.price);
-    if (!startup.ready) {
-      return;
-    }
+    if (!startup.ready) return;
 
     maybeActivatePreEntryFallingLock(trade.price);
-    if (activeFallingMarketLock()) {
-      return;
-    }
+    if (activeFallingMarketLock()) return;
 
-    // V5.1.8.2: ENTRY_STABILITY ya no convierte volatilidad moderada en 0% BUY.
-    // Si existe SOFT_FALLING_CAUTION, scalpAllocation() limita la orden a 30%.
-    // Solo un HARD_FALLING_LOCK bloquea completamente la entrada.
     const earlySignal = buildEarlyArmSignal();
-
     if (earlySignal?.ok) {
       placeBuyLimit(earlySignal, {
         batchId: observationMeta?.batchId ?? null,
@@ -4168,7 +4157,7 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
 }
 
 // ============================================================
-// V5.1.8.2 — LIVE TRADE EXTRACTION + REST FALLBACK
+// V5.1.8.3 — LIVE TRADE EXTRACTION + REST FALLBACK
 // ============================================================
 
 function extractLiveTradeUpdates(msg) {
@@ -4234,7 +4223,7 @@ async function refreshTradesRest(reason = "POLL") {
       return true;
     }
 
-    // V5.1.8.2: todos los trades de esta respuesta REST comparten el MISMO
+    // V5.1.8.3: todos los trades de esta respuesta REST comparten el MISMO
     // momento de observación. Si una orden nace mientras procesamos este lote,
     // ningún otro trade del mismo lote puede llenarla: ya estaba recibido.
     const observedAtMs = Date.now();
@@ -4271,7 +4260,7 @@ function connect() {
   gotLiveTrade = false;
   liveReady = false;
 
-  console.log("\n🔌 Conectando V5.1.8.2...");
+  console.log("\n🔌 Conectando V5.1.8.3...");
 
   ws = new WebSocket(WS_URL, "json", {
     handshakeTimeout: 15000,
@@ -4279,7 +4268,7 @@ function connect() {
   });
 
   ws.on("open", () => {
-    console.log("✅ BIGONE CONNECTED V5.1.8.2");
+    console.log("✅ BIGONE CONNECTED V5.1.8.3");
 
     ws.send(
       JSON.stringify({
@@ -4374,8 +4363,8 @@ function connect() {
       updateDrawdown();
       checkRecoveryHardStops();
 
-      if (state.mode === "SELL_LIMIT") {
-        maybeRiskExit();
+      for (const position of [...openScalpPositions()]) {
+        maybeRiskExit(position.id);
       }
     }
 
@@ -4445,7 +4434,7 @@ function connect() {
 }
 
 // ============================================================
-// V5.1.8.2 — ENTRY DIAGNOSTICS / MARKET HEALTH
+// V5.1.8.3 — ENTRY DIAGNOSTICS / MARKET HEALTH
 // ============================================================
 
 function entryDiagnostics() {
@@ -4531,7 +4520,7 @@ function liveJsonStatus() {
     ...base,
     generatedAt: iso(),
     processId: process.pid,
-    version: "5.1.8.2",
+    version: "5.1.8.3",
     localTime: localClock().text,
     testMode: "24H_CONTINUOUS",
     testElapsedHours: num(timing.elapsedHours, 2),
@@ -4651,6 +4640,9 @@ function liveJsonStatus() {
         rangeOK: zone.range.ok,
         rangeReason: zone.range.reason,
         capitalFractionIfBuy: allocation ? pct(allocation.fraction) : null,
+        effectiveCapitalToUseIfBuy: allocation ? num(allocation.capital) : null,
+        multiPositionSlotCapIfBuy: allocation ? num(allocation.slotCap) : null,
+        effectiveCashFractionIfBuy: allocation && state.cash > 0 ? pct(allocation.capital / state.cash) : null,
         allocationModeIfBuy: allocation?.mode ?? null,
       },
       highRangeCaution: {
@@ -4674,6 +4666,20 @@ function liveJsonStatus() {
     askShare30s: pct(flow30s.askShare),
     bidShare30s: pct(flow30s.bidShare),
     priceMove30s: pct(momentum30s.move),
+    openScalpPositions: openScalpPositions().map((p) => ({
+      id: p.id,
+      entry: p.entryPrice,
+      target045: p.sellTarget,
+      investedUSDT: num(p.investedUSDT),
+      pearl: num(p.pearlReceived),
+      allocationMode: p.allocationMode ?? "NORMAL_SCALP",
+      heldMinutes: num((Date.now() - p.entryTimeMs) / 60000, 2),
+      sellOrderPlacedAt: p.sellOrder?.placedAt ?? null
+    })),
+    openScalpPositionCount: openScalpPositions().length,
+    multiPositionSlotFraction: pct(MULTI_POSITION_MAX_CAPITAL_FRACTION),
+    minimumPositionSpacing: pct(MIN_POSITION_SPACING_PCT),
+
     pendingBuy: state.buyOrder
       ? {
           ...(base.pendingBuy || {}),
@@ -4683,6 +4689,8 @@ function liveJsonStatus() {
           allocationMode: state.buyOrder.allocationMode ?? "NORMAL_SCALP",
           capitalToUse: num(state.buyOrder.cash),
           capitalFraction: pct(state.buyOrder.allocationFraction ?? 1),
+          multiPositionSlotCap: num(state.buyOrder.multiPositionSlotCap),
+          openScalpPositions: openScalpPositions().length,
           hardSignalConfirmed: Boolean(state.buyOrder.hardSignalConfirmedAt),
           ageSeconds: num((Date.now() - state.buyOrder.firstPlacedAtMs) / 1000, 1),
           ttlRemainingSeconds: num(Math.max(0, BUY_TTL_MS - (Date.now() - state.buyOrder.firstPlacedAtMs)) / 1000, 1),
@@ -4695,9 +4703,12 @@ function liveJsonStatus() {
     protectedCapitalFloor: num(protectedCapitalFloor()),
     peakRealizedProfit: num(state.peakRealizedProfit),
     riskableProfitBuffer: num(riskableProfitBuffer()),
-    marketExitNetNow: state.mode === "SELL_LIMIT" ? num(simulateMarketSell(state.pearl)?.netUSDT) : null,
-    marketExitWouldRespectFloor: state.mode === "SELL_LIMIT"
-      ? (() => { const sim = simulateMarketSell(state.pearl); return sim ? sim.netUSDT + 1e-9 >= protectedCapitalFloor() : null; })()
+    marketExitNetNow: state.position ? num(simulateMarketSell(state.position.pearlReceived)?.netUSDT) : null,
+    marketExitWouldRespectFloor: state.position
+      ? (() => {
+          const sim = simulateMarketSell(state.position.pearlReceived);
+          return sim ? sim.netUSDT + 1e-9 >= protectedCapitalFloor(state.position) : null;
+        })()
       : null,
     buysPlaced: state.buyOrdersPlaced,
     earlyBuysArmed: state.earlyBuyOrdersArmed || 0,
@@ -4724,6 +4735,8 @@ function liveJsonStatus() {
     fallingMarketLocksCreated: state.fallingMarketLocksCreated || 0,
     fallingMarketLocksReleased: state.fallingMarketLocksReleased || 0,
     fallingMarketEntriesBlocked: state.fallingMarketEntriesBlocked || 0,
+    positionSpacingBlocks: state.positionSpacingBlocks || 0,
+    scalpPositionsOpened: state.scalpPositionsOpened || 0,
     maxDrawdown: pct(state.maxDrawdown),
   };
 }
@@ -4735,7 +4748,6 @@ function liveJsonStatus() {
 setInterval(() => {
   // Expira una BUY aunque durante unos segundos no llegue ningún trade.
   if (
-    state.mode === "BUY_LIMIT" &&
     state.buyOrder &&
     Date.now() - state.buyOrder.firstPlacedAtMs >= BUY_TTL_MS
   ) {
@@ -4764,7 +4776,7 @@ setInterval(() => {
   const supportPreview = supportContext60m(displayMetric?.current ?? marketRef?.price ?? null);
   const rangePosition24h = tickerRangePosition24h(displayMetric?.current ?? marketRef?.price ?? null);
   const entryDiag = entryDiagnostics();
-  if (activeFallingMarketLock() && state.mode === "WAITING" && state.cash >= MIN_SCALP_CASH_USDT) {
+  if (activeFallingMarketLock() && !state.buyOrder && state.cash >= MIN_SCALP_CASH_USDT) {
     state.fallingMarketEntriesBlocked = (state.fallingMarketEntriesBlocked || 0) + 1;
   }
 
@@ -4778,7 +4790,7 @@ setInterval(() => {
       ? state.sellOrder.qualifyingVolume / state.sellOrder.requiredFlow
       : null;
 
-  console.log("\n========== V5.1.8.2 STATUS ==========");
+  console.log("\n========== V5.1.8.3 STATUS ==========");
 
   const statusSnapshot = {
     localTime: localClock().text,
@@ -4934,6 +4946,9 @@ setInterval(() => {
           rangeOK: z.range.ok,
           rangeReason: z.range.reason,
           capitalFractionIfBuy: alloc ? pct(alloc.fraction) : null,
+          effectiveCapitalToUseIfBuy: alloc ? num(alloc.capital) : null,
+          multiPositionSlotCapIfBuy: alloc ? num(alloc.slotCap) : null,
+          effectiveCashFractionIfBuy: alloc && state.cash > 0 ? pct(alloc.capital / state.cash) : null,
           allocationModeIfBuy: alloc?.mode ?? null
         };
       })(),
@@ -4982,6 +4997,20 @@ setInterval(() => {
     bidShare30s: pct(flow30s.bidShare),
     priceMove30s: pct(momentum30s.move),
 
+    openScalpPositions: openScalpPositions().map((p) => ({
+      id: p.id,
+      entry: p.entryPrice,
+      target045: p.sellTarget,
+      investedUSDT: num(p.investedUSDT),
+      pearl: num(p.pearlReceived),
+      allocationMode: p.allocationMode ?? "NORMAL_SCALP",
+      heldMinutes: num((Date.now() - p.entryTimeMs) / 60000, 2),
+      sellOrderPlacedAt: p.sellOrder?.placedAt ?? null
+    })),
+    openScalpPositionCount: openScalpPositions().length,
+    multiPositionSlotFraction: pct(MULTI_POSITION_MAX_CAPITAL_FRACTION),
+    minimumPositionSpacing: pct(MIN_POSITION_SPACING_PCT),
+
     pendingBuy: state.buyOrder
       ? {
           price: state.buyOrder.price,
@@ -4991,6 +5020,8 @@ setInterval(() => {
           allocationMode: state.buyOrder.allocationMode ?? "NORMAL_SCALP",
           capitalToUse: num(state.buyOrder.cash),
           capitalFraction: pct(state.buyOrder.allocationFraction ?? 1),
+          multiPositionSlotCap: num(state.buyOrder.multiPositionSlotCap),
+          openScalpPositions: openScalpPositions().length,
           reserveAfterFill: num(state.buyOrder.reserveAfterFill ?? 0),
           hardSignalConfirmed: Boolean(state.buyOrder.hardSignalConfirmedAt),
           hardSignalConfirmedAt: state.buyOrder.hardSignalConfirmedAt ?? null,
@@ -5082,14 +5113,14 @@ setInterval(() => {
     peakRealizedProfit: num(state.peakRealizedProfit),
     riskableProfitBuffer: num(riskableProfitBuffer()),
 
-    marketExitNetNow: state.mode === "SELL_LIMIT"
-      ? num(simulateMarketSell(state.pearl)?.netUSDT)
+    marketExitNetNow: state.position
+      ? num(simulateMarketSell(state.position.pearlReceived)?.netUSDT)
       : null,
 
-    marketExitWouldRespectFloor: state.mode === "SELL_LIMIT"
+    marketExitWouldRespectFloor: state.position
       ? (() => {
-          const sim = simulateMarketSell(state.pearl);
-          return sim ? sim.netUSDT + 1e-9 >= protectedCapitalFloor() : null;
+          const sim = simulateMarketSell(state.position.pearlReceived);
+          return sim ? sim.netUSDT + 1e-9 >= protectedCapitalFloor(state.position) : null;
         })()
       : null,
 
@@ -5120,6 +5151,8 @@ setInterval(() => {
     fallingMarketLocksCreated: state.fallingMarketLocksCreated || 0,
     fallingMarketLocksReleased: state.fallingMarketLocksReleased || 0,
     fallingMarketEntriesBlocked: state.fallingMarketEntriesBlocked || 0,
+    positionSpacingBlocks: state.positionSpacingBlocks || 0,
+    scalpPositionsOpened: state.scalpPositionsOpened || 0,
 
     maxDrawdown: pct(state.maxDrawdown)
   };
@@ -5136,7 +5169,7 @@ setInterval(() => {
 
 console.log(`
 =========================================================
-PEARL / USDT PAPER SCALPER V5.1.8.2
+PEARL / USDT PAPER SCALPER V5.1.8.3
 =========================================================
 
 CAPITAL FICTICIO:
@@ -5161,25 +5194,28 @@ NO EXISTE:
 
 SÍ EXISTE:
 - fill causal ESTRICTO por tiempo de observación
-- V5.1.8.2: un trade del mismo batch que creó la orden NUNCA puede llenarla
-- V5.1.8.2: BUY/SELL registran orderPlacedAt + tradeExchangeTime + causalAgeMs
-- V5.1.8.2: SELL LIMIT se imprime explícitamente al abrirse
-- V5.1.8.2: trade que ATRAVIESA una LIMIT = FULL FILL inmediato
-- V5.1.8.2: trade EXACTO en la LIMIT = respeta cola + tamaño propio
-- V5.1.8.2: target normal +0.45% bruto
-- V5.1.8.2: STARTUP_CONTEXT_LOCK observa 4 min LIVE antes de permitir la primera BUY
-- V5.1.8.2: <=75% rango24h puede usar 100%; 75–82% máximo 30%; >82% NO RANGE BUY
-- V5.1.8.2: PRICE_LADDER: high24h=1.8722 => BUY <1.8000; romper 1.9000+1 tick habilita 1.8x
-- V5.1.8.2: ruptura estructural => RECOVERY_HOLD; NO venta inmediata
-- V5.1.8.2: RECOVERY_HOLD activa FALLING_MARKET_LOCK sobre el cash restante
-- V5.1.8.2: HARD_FALLING_LOCK puede activarse PRE-ENTRY solo ante desplome/slow-bleed fuerte
-- V5.1.8.2: SOFT_FALLING_CAUTION opera al 30%; ENTRY_STABILITY queda como contexto de calidad
-- V5.1.8.2: PREENTRY HARD LOCK libera tras >=2 min sin nuevo low + 5m/30s estables + rebote
-- V5.1.8.2: durante HARD_FALLING_LOCK NO hay nuevas BUY, aunque haya cash
-- V5.1.8.2: lock cae solo con STABLE_ENOUGH usando 10m + 5m + 30s + flow5m
+- V5.1.8.3: un trade del mismo batch que creó la orden NUNCA puede llenarla
+- V5.1.8.3: BUY/SELL registran orderPlacedAt + tradeExchangeTime + causalAgeMs
+- V5.1.8.3: SELL LIMIT se imprime explícitamente al abrirse
+- V5.1.8.3: trade que ATRAVIESA una LIMIT = FULL FILL inmediato
+- V5.1.8.3: trade EXACTO en la LIMIT = respeta cola + tamaño propio
+- V5.1.8.3: target normal +0.45% bruto
+- V5.1.8.3: MULTI-POSITION: una BUY pendiente máxima + múltiples SELL LIMIT independientes
+- V5.1.8.3: cada posición usa máximo 30% del capital operativo; cash restante sigue evaluando entradas
+- V5.1.8.3: nuevas entradas exigen >=0.25% de separación de toda posición/recovery abierta
+- V5.1.8.3: STARTUP_CONTEXT_LOCK observa 4 min LIVE antes de permitir la primera BUY
+- V5.1.8.3: régimen <=75%=100% permitido, 75–82%=30%, >82%=bloqueado; el slot multi limita cada posición a 30%
+- V5.1.8.3: PRICE_LADDER: high24h=1.8722 => BUY <1.8000; romper 1.9000+1 tick habilita 1.8x
+- V5.1.8.3: ruptura estructural => RECOVERY_HOLD; NO venta inmediata
+- V5.1.8.3: RECOVERY_HOLD activa FALLING_MARKET_LOCK sobre el cash restante
+- V5.1.8.3: HARD_FALLING_LOCK puede activarse PRE-ENTRY solo ante desplome/slow-bleed fuerte
+- V5.1.8.3: SOFT_FALLING_CAUTION opera al 30%; ENTRY_STABILITY queda como contexto de calidad
+- V5.1.8.3: PREENTRY HARD LOCK libera tras >=2 min sin nuevo low + 5m/30s estables + rebote
+- V5.1.8.3: durante HARD_FALLING_LOCK NO hay nuevas BUY, aunque haya cash
+- V5.1.8.3: lock cae solo con STABLE_ENOUGH usando 10m + 5m + 30s + flow5m
 - RECOVERY_HOLD sale en break-even neto (+0.02% buffer)
 - RECOVERY_HOLD: -10% SOLO arma RECOVERY_DANGER; NO vende
-- V5.1.8.2: hard stop solo si rompe low24hAnchor -1.5% por ~2 min + presión vendedora + no reclaim
+- V5.1.8.3: hard stop solo si rompe low24hAnchor -1.5% por ~2 min + presión vendedora + no reclaim
 - BREAKDOWN_LOCK bloquea recompra del soporte roto
 - lock se libera por reclaim confirmado 2 min o nuevo soporte >=0.50% más abajo
 - capital PAPER extra se inyecta con PAPER_INJECT_USDT + PAPER_INJECT_ID
@@ -5193,13 +5229,13 @@ SÍ EXISTE:
 - early arm NO espera ASK5m/drawdown/rango duro; arma la LIMIT apenas existe zona maker válida
 - ASK5m queda como CONTEXTO y dentro del hardSignal; NO bloquea EARLY_ARM
 - hardSignal sigue registrándose como confirmación posterior; NO es requisito para fill
-- V5.1.8.2: tradeUpdate se procesa incluso durante bootstrap/reconexión
-- V5.1.8.2: fallback REST de trades cada 5 s si el WS de trades queda silencioso
-- V5.1.8.2: ticker.close/libro pueden dar referencia para EARLY_ARM; NUNCA generan fills
+- V5.1.8.3: tradeUpdate se procesa incluso durante bootstrap/reconexión
+- V5.1.8.3: fallback REST de trades cada 5 s si el WS de trades queda silencioso
+- V5.1.8.3: ticker.close/libro pueden dar referencia para EARLY_ARM; NUNCA generan fills
 - soporte 60m automático SOLO como referencia bajista
 - ticker rolling 24h BigONE: open/high/low/close/volume
 - HIGH 24h = ENTRY LADDER dinámico; no compramos en su misma banda de 0.10
-- V5.1.8.2 existe ENTRY ZONE gate para evitar congelar capital cerca del high24h
+- V5.1.8.3 existe ENTRY ZONE gate para evitar congelar capital cerca del high24h
 - targetSeenRecently es ADVISORY, no requisito
 - BUY pendiente NO se cancela por tocar/cruzar ligeramente la entrada
 - cancelación solo por ruptura estructural confirmada:
@@ -5227,7 +5263,7 @@ SÍ EXISTE:
 - FLOW 5 min = contexto
 - FLOW 30 s = micro momentum + confirmación de ruptura, nunca persecución alcista
 
-ESTRUCTURA V5.1.8.2:
+ESTRUCTURA V5.1.8.3:
 - NORMAL_SCALP = target +0.45%
 - STARTUP_CONTEXT_LOCK = 4 min + >=20 trades LIVE antes de primera BUY
 - RANGE SIZING = <=75% usa 100%; 75–82% usa 30%; >82% bloquea RANGE BUY
