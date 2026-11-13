@@ -190,6 +190,7 @@ function createRuntimeApi({ rootDir, getRuntime, getState, port = 4174 }) {
 
   let databaseRows = Number(countMetrics.get().count) || 0;
   let latestSnapshot = null;
+  let latestHistoryKey = null;
   let lastDatabaseWriteAt = 0;
   let lastPruneAt = 0;
   let timer = null;
@@ -224,6 +225,22 @@ function createRuntimeApi({ rootDir, getRuntime, getState, port = 4174 }) {
         runtimeDb: databaseFileState(databasePath, databaseRows),
       },
     };
+  }
+
+  function historyKey(files) {
+    return ["events", "trades", "signals"].map((name) => {
+      const file = files[name] ?? {};
+      return `${name}:${file.bytes}:${file.records}:${file.parseErrors}:${file.partialLine}:${file.lastModifiedAt}`;
+    }).join("|");
+  }
+
+  function streamSnapshot(snapshot, includeHistory) {
+    if (includeHistory) return snapshot;
+    const live = { ...snapshot };
+    delete live.events;
+    delete live.trades;
+    delete live.signals;
+    return live;
   }
 
   function persistRuntime(runtime) {
@@ -279,8 +296,20 @@ function createRuntimeApi({ rootDir, getRuntime, getState, port = 4174 }) {
       const now = Date.now();
       if (now - lastDatabaseWriteAt >= HISTORY_INTERVAL_MS) persistRuntime(latestSnapshot.runtime);
       latestSnapshot.files.runtimeDb = databaseFileState(databasePath, databaseRows);
-      const payload = `event: snapshot\ndata: ${JSON.stringify(latestSnapshot)}\n\n`;
-      for (const response of subscribers) response.write(payload);
+      const nextHistoryKey = historyKey(latestSnapshot.files);
+      const payload = `event: snapshot\ndata: ${JSON.stringify(streamSnapshot(latestSnapshot, nextHistoryKey !== latestHistoryKey))}\n\n`;
+      latestHistoryKey = nextHistoryKey;
+      for (const response of subscribers) {
+        if (response.writableEnded || response.destroyed) {
+          subscribers.delete(response);
+          continue;
+        }
+        try {
+          response.write(payload);
+        } catch {
+          subscribers.delete(response);
+        }
+      }
     } catch (error) {
       console.error("⚠️ Dashboard API refresh failed:", error.message);
     }
@@ -380,7 +409,9 @@ function createRuntimeApi({ rootDir, getRuntime, getState, port = 4174 }) {
         return;
       }
       if (pathname === "/api/health") {
-        sendJson(response, 200, { ok: true, botVersion: "5.1.8", processId: process.pid, dataDirectory: absoluteRoot });
+        const runtime = getRuntime() ?? {};
+        const state = getState() ?? {};
+        sendJson(response, 200, { ok: true, botVersion: runtime.version ?? state.version ?? null, processId: process.pid, dataDirectory: absoluteRoot });
         return;
       }
       if (pathname === "/api/snapshot") {
@@ -398,6 +429,7 @@ function createRuntimeApi({ rootDir, getRuntime, getState, port = 4174 }) {
           Connection: "keep-alive",
           "X-Accel-Buffering": "no",
         });
+        response.flushHeaders?.();
         response.write(`event: snapshot\ndata: ${JSON.stringify(latestSnapshot ?? buildSnapshot())}\n\n`);
         subscribers.add(response);
         const heartbeat = setInterval(() => response.write(": keep-alive\n\n"), 15_000);
@@ -424,7 +456,7 @@ function createRuntimeApi({ rootDir, getRuntime, getState, port = 4174 }) {
     timer = setInterval(refresh, 1000);
     server.on("error", (error) => {
       if (error.code === "EADDRINUSE") {
-        console.error(`⚠️ Dashboard API port ${port} is occupied. Free that port and restart V5.1.8 to enable its live API.`);
+        console.error(`⚠️ Dashboard API port ${port} is occupied. Free that port and restart the bot to enable its live API.`);
       } else {
         console.error("⚠️ Dashboard API failed:", error.message);
       }

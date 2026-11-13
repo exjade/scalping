@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0d10" />
+    <meta name="description" content="Dashboard local de solo lectura para PEARL/USDT paper trading." />
+    <title>PEARL · Paper Trading</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // PEARL V5.2.0 — addon mínimo para el dashboard ORIGINAL.
+      // No reemplaza React, no modifica sus componentes y no dibuja un dashboard nuevo.
+      (() => {
+        const API = "http://127.0.0.1:4175";
+        const ID = "pearl-bot-control-addon";
+      
+        if (document.getElementById(ID)) return;
+      
+        const style = document.createElement("style");
+        style.textContent = `
+          #${ID}{position:fixed;right:18px;bottom:18px;z-index:2147483647;display:flex;align-items:center;gap:8px;padding:9px 10px;border:1px solid rgba(148,163,184,.30);border-radius:10px;background:rgba(11,13,16,.94);box-shadow:0 10px 30px rgba(0,0,0,.28);font:600 12px/1.2 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#e5e7eb;backdrop-filter:blur(8px)}
+          #${ID} .pearl-status{min-width:78px;padding:7px 9px;border-radius:7px;text-align:center;border:1px solid rgba(148,163,184,.22);font-weight:800;letter-spacing:.03em}
+          #${ID} .pearl-status.running{color:#86efac;background:rgba(22,101,52,.20);border-color:rgba(34,197,94,.45)}
+          #${ID} .pearl-status.paused{color:#fca5a5;background:rgba(127,29,29,.22);border-color:rgba(239,68,68,.45)}
+          #${ID} .pearl-status.offline{color:#cbd5e1;background:rgba(51,65,85,.25)}
+          #${ID} button{appearance:none;border:1px solid rgba(148,163,184,.32);border-radius:7px;padding:7px 10px;background:#172033;color:#f8fafc;font:700 12px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;cursor:pointer}
+          #${ID} button:hover:not(:disabled){filter:brightness(1.13)}
+          #${ID} button:disabled{opacity:.38;cursor:not-allowed}
+          #${ID} button.open{border-color:rgba(34,197,94,.48);background:rgba(22,101,52,.35)}
+          #${ID} button.close{border-color:rgba(239,68,68,.48);background:rgba(127,29,29,.34)}
+          #${ID} .pearl-config{display:flex;align-items:center;gap:6px}
+          #${ID} label{display:flex;flex-direction:column;gap:3px;color:#94a3b8;font-size:9px;text-transform:uppercase}
+          #${ID} input{width:78px;padding:6px 7px;border:1px solid rgba(148,163,184,.25);border-radius:6px;background:#0f172a;color:#f8fafc;font:600 11px system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+          #${ID} input:disabled{opacity:.45}
+        `;
+        document.head.appendChild(style);
+      
+        const root = document.createElement("div");
+        root.id = ID;
+        root.innerHTML = `
+          <span class="pearl-status offline">BOT …</span>
+          <div class="pearl-config"><label>Target<input class="target" type="number" min="0.0001" step="0.0001" value="0.0100"></label><label>Bank<input class="bank" type="number" min="0.01" step="0.01" value="10000"></label><button class="apply" type="button">APLICAR</button></div>
+          <button class="open" type="button">ABRIR BOT</button>
+          <button class="close" type="button">CERRAR BOT</button>
+        `;
+        document.body.appendChild(root);
+      
+        const status = root.querySelector(".pearl-status");
+        const openBtn = root.querySelector("button.open");
+        const closeBtn = root.querySelector("button.close");
+        const applyBtn = root.querySelector("button.apply");
+        const targetInput = root.querySelector("input.target");
+        const bankInput = root.querySelector("input.bank");
+        let busy = false;
+      
+        function render(data) {
+          const running = data?.tradingEnabled === true;
+          status.textContent = running ? "RUNNING" : "PAUSED";
+          status.className = `pearl-status ${running ? "running" : "paused"}`;
+          openBtn.disabled = busy || running;
+          closeBtn.disabled = busy || !running;
+          applyBtn.disabled = busy || running;
+          targetInput.disabled = busy || running;
+          bankInput.disabled = busy || running;
+          if (document.activeElement !== targetInput && data?.targetPriceDelta != null) targetInput.value = Number(data.targetPriceDelta).toFixed(4);
+          if (document.activeElement !== bankInput && data?.operatingBank != null) bankInput.value = String(data.operatingBank);
+          status.title = running
+            ? "Entradas automáticas habilitadas"
+            : "No abre nuevas BUY. Las posiciones ya abiertas siguen gestionándose.";
+        }
+      
+        function offline() {
+          status.textContent = "OFFLINE";
+          status.className = "pearl-status offline";
+          openBtn.disabled = busy;
+          closeBtn.disabled = busy;
+          applyBtn.disabled = busy;
+          targetInput.disabled = busy;
+          bankInput.disabled = busy;
+        }
+      
+        async function call(path, method = "GET", body) {
+          const response = await fetch(`${API}${path}`, { method, cache: "no-store", headers: body ? { "Content-Type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        }
+      
+        async function refresh() {
+          if (busy) return;
+          try { render(await call("/status")); } catch { offline(); }
+        }
+      
+        async function configure() {
+          const targetPriceDelta = Number(targetInput.value);
+          const operatingBank = Number(bankInput.value);
+          if (!Number.isFinite(targetPriceDelta) || targetPriceDelta < 0.0001 || !Number.isFinite(operatingBank) || operatingBank <= 0) throw new Error("Configuración inválida");
+          render(await call("/configure", "POST", { targetPriceDelta, operatingBank }));
+        }
+
+        async function setState(path) {
+          if (busy) return;
+          busy = true;
+          openBtn.disabled = true;
+          closeBtn.disabled = true;
+          try {
+            if (path === "/open") await configure();
+            render(await call(path, "POST"));
+          }
+          catch (error) { offline(); console.error("PEARL bot control:", error); }
+          finally { busy = false; setTimeout(refresh, 250); }
+        }
+      
+        applyBtn.addEventListener("click", async () => {
+          if (busy) return;
+          busy = true;
+          try { await configure(); } catch (error) { console.error("PEARL bot configuration:", error); }
+          finally { busy = false; setTimeout(refresh, 250); }
+        });
+        openBtn.addEventListener("click", () => setState("/open"));
+        closeBtn.addEventListener("click", () => setState("/close"));
+        refresh();
+        setInterval(refresh, 1500);
+      })();
+    </script>
+  </body>
+</html>

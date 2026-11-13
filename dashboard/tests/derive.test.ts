@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { BotSnapshot } from "../shared/types.js";
-import { deriveEngine, deriveMarket, derivePortfolio, exitTrades, feeRate } from "../src/lib/derive.js";
+import { botConfiguration, deriveBuyDiagnostics, deriveEngine, deriveMarket, derivePortfolio, entryExplanation, exitTrades, feeRate } from "../src/lib/derive.js";
 
 const emptyFiles = {
   state: { exists: true, bytes: 0, records: 1, parseErrors: 0, partialLine: false, lastModifiedAt: null },
@@ -76,4 +76,54 @@ test("derives fee rates from logged BUY and SELL fills when explicit fee setting
   };
   assert.ok(Math.abs((feeRate(snapshot, "buy") ?? 0) - 0.002) < 1e-9);
   assert.ok(Math.abs((feeRate(snapshot, "sell") ?? 0) - 0.002) < 1e-6);
+});
+
+test("derives BUY fee from the V5.2 USDT fee field", () => {
+  const snapshot: BotSnapshot = {
+    mode: "live", generatedAt: new Date().toISOString(), state: {}, summary24h: null, events: [],
+    trades: [
+      { type: "PAPER_BUY_FILLED", investedUSDT: 10_000, buyFeeUSDT: 20 },
+    ], signals: [], files: emptyFiles, dataDirectoryConfigured: true,
+  };
+  assert.equal(feeRate(snapshot, "buy"), 0.002);
+});
+
+test("derives V5.2 target, bank and local control from the live runtime", () => {
+  assert.deepEqual(botConfiguration({
+    version: "5.2.0",
+    targetPriceDelta: 0.01,
+    operatingBank: 7_500,
+    botControl: { controlPort: 4175, tradingEnabled: true },
+  }, {}), {
+    version: "5.2.0",
+    targetPriceDelta: 0.01,
+    capital: 7_500,
+    controlPort: 4175,
+    tradingEnabled: true,
+  });
+});
+
+test("explains why BUY limits did not fill", () => {
+  const snapshot: BotSnapshot = {
+    mode: "live", generatedAt: new Date().toISOString(),
+    state: { buyOrdersPlaced: 4, buyOrdersCancelled: 3, buyOrdersFilled: 1 },
+    summary24h: null,
+    events: [
+      { type: "BUY CANCELLED", reason: "TTL_EXPIRED" },
+      { type: "BUY CANCELLED", reason: "PREENTRY_HARD_FALLING_MARKET_LOCK" },
+      { type: "BUY FILL BLOCKED BY CAUSALITY" },
+      { type: "WS ERROR" },
+    ],
+    trades: [{ type: "PAPER_BUY_FILLED" }], signals: [], files: emptyFiles, dataDirectoryConfigured: true,
+  };
+  assert.deepEqual(deriveBuyDiagnostics(snapshot), {
+    placed: 4, cancelled: 3, filled: 1, fillRate: 0.25,
+    ttlExpired: 1, fallingLock: 1, supportResize: 0, softFallingResize: 0, userPaused: 0,
+    otherCancelled: 0, websocketErrors: 1, causalBlocks: 1,
+    lastCancellation: snapshot.events[1],
+  });
+});
+
+test("does not describe a high range as blocked when support entry overrides it", () => {
+  assert.match(entryExplanation(0.9, 0.3, "SUPPORT_CAUTION", true), /soporte validado/i);
 });

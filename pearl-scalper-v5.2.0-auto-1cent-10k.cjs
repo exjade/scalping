@@ -1,28 +1,30 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+const http = require("node:http");
 const WebSocket = require("ws");
 const { createRuntimeApi } = require("./dashboard/runtime-api.cjs");
 
 // ============================================================
-// PEARL / USDT PAPER SCALPER V5.1.8
+// PEARL / USDT PAPER SCALPER V5.2.0 AUTO +$0.0100 / 10K
 // ============================================================
 // 100% PAPER — NO API KEY — NO REAL ORDERS
 //
 // Objetivo del test:
 // - correr 24 horas completas sin reglas horarias de trading
-// - target normal: +0.45% BRUTO
+// - target normal: +$0.0100 de precio PEARL por operación
 // - fills causales
 // - EARLY ARM: BUY LIMIT se coloca antes de que madure la señal completa
-// - BUY LIMIT estática por intento (sin reprice alcista)
-// - soporte automático de 60 min SOLO como referencia bajista
+// - BUY LIMIT guiada por soporte 60M/120M (sin reprice alcista)
+// - el soporte 60M o 120M puede activar la entrada; no deben coincidir
 // - ticker rolling 24 h de BigONE (open/high/low/close/volume)
-// - V5.1.8: usar high24h como ENTRY LADDER dinámico para no comprar en el mismo escalón del máximo
-// - cancelar BUY pendiente solo ante ruptura bajista material confirmada
+// - V5.2.0: high24h es contexto; una BUY validada en soporte puede saltar ese veto
+// - V5.1.8.3: NORMAL_SCALP -> SOFT_FALLING_CONTEXT -> HARD_FALLING_LOCK(0%)
+// - cancelar/rearmar BUY pendiente ante ruptura bajista o desplazamiento del soporte
 // - stop defensivo normal SOLO si respeta el capital protegido
 // - ruptura estructural NO liquida: mueve la posición a RECOVERY_HOLD
-// - RECOVERY_HOLD sale en break-even neto + buffer mínimo
-// - RECOVERY_HOLD solo acepta pérdida si llega a -10% de SU propio bucket
+// - RECOVERY_HOLD conserva el mismo target +$0.0100; solo el hard stop puede cerrar con pérdida
+// - RECOVERY_HOLD: -10% arma RECOVERY_DANGER; hard stop solo tras fallo del low24hAnchor
 // - BREAKDOWN_LOCK evita recomprar inmediatamente el soporte roto
 // - capital nuevo puede inyectarse al SCALP_BUCKET sin mezclarse con la posición atrapada
 // - registrar exactamente el punto de 24h y seguir corriendo
@@ -38,20 +40,25 @@ const TICKER_REST_URL = "https://api.big.one/api/v3/asset_pairs/PEARL-USDT/ticke
 const TRADES_REST_URL = "https://api.big.one/api/v3/asset_pairs/PEARL-USDT/trades";
 const TIMEZONE = "America/Ciudad_Juarez";
 
-const START_CAPITAL = 100;
+const START_CAPITAL = 10000;
 const BUY_FEE = 0.002;   // 0.20%
 const SELL_FEE = 0.002;  // 0.20%
 
 // IMPORTANTE: ESTE ES EL TARGET DEL BOT.
-const TARGET_GROSS = 0.0045; // +0.4500% movimiento de precio
+// Ya no es un porcentaje fijo: cada posición busca un delta configurable en USDT.
+const DEFAULT_TARGET_PRICE_DELTA = 0.0100;
+
+// Control general del motor automático. El dashboard original sigue en 4174.
+// Este puerto es SOLO API local para los botones Abrir/Cerrar bot.
+const BOT_CONTROL_PORT = Number(process.env.PEARL_CONTROL_PORT || 4175);
 
 // ============================================================
-// V5.1.8 — RECOVERY / CAPITAL BUCKETS / ANCHORED 24H SUPPORT
+// V5.1.8.3 — RECOVERY / CAPITAL BUCKETS / ANCHORED 24H SUPPORT
 // ============================================================
 // Una ruptura estructural ya NO realiza una pérdida de 1–3% automáticamente.
 // La posición se separa del SCALP_BUCKET y pasa a RECOVERY_HOLD.
 //
-// V5.1.8 cambia el significado del -10%:
+// V5.1.8.3 cambia el significado del -10%:
 // -10% = RECOVERY_DANGER (alarma), NO venta.
 // El HARD STOP real requiere además invalidar el LOW 24H ANCLADO al momento
 // de entrar en recovery: romperlo 1.5%, permanecer debajo ~2 min, mantener
@@ -64,16 +71,23 @@ const RECOVERY_ANCHOR_BREAK_PCT = 0.0150;         // romper low24hAnchor >=1.50%
 const RECOVERY_ANCHOR_BREAK_CONFIRM_MS = 2 * 60 * 1000;
 const RECOVERY_ANCHOR_ASK_SHARE_5M = 0.62;        // presión vendedora persistente
 const RECOVERY_ANCHOR_ASK_SHARE_30S = 0.70;       // presión vendedora rápida
-const RECOVERY_EXIT_BUFFER_PCT = 0.0002;          // +0.02% sobre break-even exacto
 const MIN_SCALP_CASH_USDT = 1.00;
 
+// V5.2.0 — una operación normal usa todo el bank disponible.
+// El 30% queda reservado únicamente para una BUY demasiado cerca del soporte.
+// Solo una BUY LIMIT pendiente a la vez; pueden coexistir varias SELL LIMIT.
+const MULTI_POSITION_MAX_CAPITAL_FRACTION = 1.00;
+const SUPPORT_CAUTION_CAPITAL_FRACTION = 0.30;
+const SUPPORT_CAUTION_DISTANCE_PCT = 0.0030;      // <=0.30% sobre el soporte
+const MIN_POSITION_SPACING_PCT = 0.0025; // 0.25%
+
 // ============================================================
-// V5.1.8 — STARTUP CONTEXT + EXHAUSTION CAUTION
+// V5.1.8.3 — STARTUP CONTEXT + EXHAUSTION CAUTION
 // ============================================================
 // El bot NO compra a ciegas al arrancar. Durante 4 minutos observa trades LIVE
 // del proceso actual. El snapshot histórico sigue sirviendo para soportes/rangos,
 // pero NO cuenta como contexto suficiente para habilitar la primera BUY.
-const STARTUP_CONTEXT_LOCK_MS = 4 * 60 * 1000;
+const STARTUP_CONTEXT_LOCK_MS = 2 * 60 * 1000;
 const STARTUP_CONTEXT_MIN_LIVE_TRADES = 20;
 
 // HIGH 24h sigue siendo CONTEXTO, nunca resistencia rígida.
@@ -87,40 +101,84 @@ const HIGH_RANGE_CAUTION_LOWER_HIGH_PCT = 0.0010;    // high 5m >=0.10% menor qu
 const HIGH_RANGE_CAUTION_ASK_SHARE = 0.55;
 const HIGH_RANGE_CAUTION_MICRO_DROP = 0.0005;
 const HIGH_RANGE_CAUTION_MIN_EXHAUSTION_VOTES = 2;
-const HIGH_RANGE_CAUTION_CAPITAL_FRACTION = 0.30;
 
-// V5.1.8 — RANGE POSITION SIZING + PRICE LADDER GATE
-// <=75% del rango 24h: puede usar 100% del SCALP_BUCKET.
-// >75% y <=82%: máximo 30%.
-// >82%: NO RANGE BUY.
+// V5.2.0 — RANGE POSITIONING + SUPPORT ENTRY
+// El rango 24h protege contra compras en la parte alta si no existe soporte.
+// Una BUY alineada con soporte 60M/120M puede saltar ese veto de contexto.
 //
 // Nunca compramos dentro de la MISMA banda decimal de 0.10 USDT donde vive
 // el high24h. Ejemplo: high24h=1.8722 => solo BUY <1.8000.
 // Para habilitar BUY 1.8x el high24h debe romper 1.9000 por al menos 1 tick.
 const RANGE_FULL_CAPITAL_MAX_24H_POSITION = 0.75;
 const RANGE_CAUTION_MAX_24H_POSITION = 0.82;
-const RANGE_CAUTION_CAPITAL_FRACTION = 0.30;
 const PRICE_LADDER_STEP = 0.10;
 const PRICE_LADDER_BREAK_CONFIRM_TICKS = 1;
+const SUPPORT_ENTRY_MAX_DISTANCE_PCT = 0.0125; // no perseguir soportes a >1.25% del mercado
+const SUPPORT_REARM_MIN_MOVE_PCT = 0.0005;    // rearmar si el soporte baja al menos 0.05%
+const SUPPORT_REARM_MIN_AGE_MS = 10 * 1000;   // conservar prioridad unos segundos antes de rearmar
 
-// Detector PRE-ENTRY de caída activa. No predice un fondo: solo evita comprar
-// mientras el precio sigue desplazándose hacia abajo. Usa exclusivamente trades
-// LIVE observados desde que inició este proceso.
-const PREENTRY_FALLING_MOVE_4M = 0.0030;             // <= -0.30%
-const PREENTRY_FALLING_MOVE_5M = 0.0040;             // <= -0.40%
-const PREENTRY_FALLING_MOVE_10M = 0.0075;            // <= -0.75%
-const PREENTRY_FALLING_PULLBACK_FROM_HIGH_5M = 0.0050; // >=0.50% bajo high5m
+// V5.1.8.3 — PRE-ENTRY FALLING REGIME.
+// La volatilidad normal NO debe apagar el scalper. Separamos:
+// NORMAL_SCALP -> SOFT_FALLING_CONTEXT -> HARD_FALLING_LOCK (0%).
+//
+// SOFT: deterioro moderado; ya no reduce sizing por sí solo.
+// HARD: desplome/shock o slow-bleed persistente. Crea el lock real.
+const SOFT_FALLING_MOVE_4M = 0.0040;                 // <= -0.40%
+const SOFT_FALLING_MOVE_5M = 0.0050;                 // <= -0.50%
+const SOFT_FALLING_MOVE_10M = 0.0075;                // <= -0.75%
+
+const HARD_FALLING_MOVE_5M = 0.0125;                 // <= -1.25%
+const HARD_FALLING_MOVE_10M = 0.0175;                // <= -1.75%
+const HARD_FALLING_DROP_FROM_HIGH_15M = 0.0200;      // >=2.00% bajo high15m
+const HARD_FALLING_MOMENTUM_30S = 0.0075;            // <= -0.75%, exige continuidad
+const HARD_FALLING_MOMENTUM_CONFIRM_MOVE_5M = 0.0040;// continuación 5m <= -0.40%
+
+// Ruta HARD adicional para slow-bleed persistente.
+const HARD_SLOW_BLEED_MOVE_5M = 0.0080;              // <= -0.80%
+const HARD_SLOW_BLEED_MOVE_10M = 0.0100;             // <= -1.00%
+const HARD_SLOW_BLEED_RECENT_LOW_MS = 2 * 60 * 1000;
+const HARD_SLOW_BLEED_NEAR_LOW_PCT = 0.0025;         // dentro de 0.25% del low10m
+
+// Contexto auxiliar; ya NO crea un HARD lock por sí solo.
+const PREENTRY_FALLING_PULLBACK_FROM_HIGH_5M = 0.0050;
 const PREENTRY_FALLING_ASK_SHARE = 0.62;
-const PREENTRY_FALLING_MICRO_DROP = 0.0010;          // 30s <= -0.10%
-const PREENTRY_FALLING_NEAR_LOW_PCT = 0.0020;        // dentro de 0.20% del low5m
+const PREENTRY_FALLING_MICRO_DROP = 0.0010;
+const PREENTRY_FALLING_NEAR_LOW_PCT = 0.0020;
 
 // ============================================================
-// V5.1.8 — FALLING MARKET LOCK / STABILITY GATE
+// V5.1.8.3 — ENTRY STABILITY GATE / SLOW-BLEED PROTECTION
+// ============================================================
+// La zona de precio permitida NO basta para comprar. Si el mercado viene
+// descendiendo materialmente, esperamos que deje de hacer mínimos y que 10m/5m/30s
+// se estabilicen antes de armar una BUY. Esto evita comprar 1.79 simplemente porque
+// el ladder lo permite mientras PEARL todavía cae hacia 1.73.
+const ENTRY_STABILITY_WINDOW_MS = 15 * 60 * 1000;
+const ENTRY_STABILITY_DROP_FROM_HIGH_15M = 0.0100;   // >=1.00% bajo high15m => requiere estabilidad
+const ENTRY_STABILITY_DROP_10M = 0.0040;             // move10m <= -0.40% => requiere estabilidad
+const ENTRY_STABILITY_DROP_5M = 0.0025;              // move5m <= -0.25% => requiere estabilidad
+const ENTRY_STABILITY_MIN_LOW_AGE_MS = 3 * 60 * 1000; // 3 min sin nuevo low del bloque
+const ENTRY_STABILITY_MAX_DROP_10M = 0.0020;         // para liberar: move10m >= -0.20%
+const ENTRY_STABILITY_MAX_DROP_5M = 0.0010;          // para liberar: move5m >= -0.10%
+const ENTRY_STABILITY_MAX_DROP_30S = 0.0005;         // para liberar: move30s >= -0.05%
+const ENTRY_STABILITY_MAX_ASK_SHARE_5M = 0.60;
+const ENTRY_STABILITY_MIN_BOUNCE_FROM_LOW_5M = 0.0015; // +0.15% desde low5m
+const ENTRY_STABILITY_TIGHT_RANGE_5M = 0.0030;       // o rango5m <=0.30%
+
+// ============================================================
+// V5.1.8.3 — FALLING MARKET LOCK / STABILITY GATE
 // ============================================================
 // Si una posición pasa a RECOVERY_HOLD por ruptura estructural, el cash
 // restante NO se reutiliza durante la caída. El lock solo se libera cuando
 // el mercado deja de hacer nuevos lows materiales y 10m/5m/30s muestran
 // estabilidad suficiente. No intenta predecir el fondo; evita comprar cada escalón.
+// PRE-ENTRY HARD lock: liberación más rápida una vez desaparece el desplome.
+// Los locks nacidos desde RECOVERY mantienen la confirmación conservadora de 5m.
+const PREENTRY_HARD_LOCK_MIN_MS = 2 * 60 * 1000;
+const PREENTRY_HARD_LOCK_NO_NEW_LOW_MS = 2 * 60 * 1000;
+const PREENTRY_HARD_RELEASE_MAX_DROP_5M = 0.0025;     // move5m >= -0.25%
+const PREENTRY_HARD_RELEASE_MAX_DROP_30S = 0.0015;   // move30s >= -0.15% o N/A
+const PREENTRY_HARD_RELEASE_MIN_BOUNCE_5M = 0.0025;  // +0.25% desde low5m
+
 const FALLING_LOCK_MIN_MS = 5 * 60 * 1000;
 const FALLING_LOCK_NO_NEW_LOW_MS = 5 * 60 * 1000;
 const FALLING_LOCK_MEANINGFUL_NEW_LOW_PCT = 0.0010;  // nuevo low >=0.10% más abajo
@@ -137,14 +195,14 @@ const BREAKDOWN_RECLAIM_CONFIRM_MS = 2 * 60 * 1000;
 const BREAKDOWN_NEW_SUPPORT_PCT = 0.0050;    // nuevo soporte >=0.50% más abajo
 
 // Inyección PAPER opcional. Ejemplo Git Bash:
-// PAPER_INJECT_USDT=100 PAPER_INJECT_ID=extra-100-1 node pearl-scalper-v5.1.8.cjs
+// PAPER_INJECT_USDT=100 PAPER_INJECT_ID=extra-100-1 node pearl-scalper-v5.1.8.3.1.cjs
 // El ID evita aplicar dos veces la misma aportación al reiniciar.
 const PAPER_INJECT_USDT = Number(process.env.PAPER_INJECT_USDT || 0);
 const PAPER_INJECT_ID = String(process.env.PAPER_INJECT_ID || "").trim();
 
 const TICK = 0.0001;
 
-// V5.1.8 — comparación robusta de precios al tick.
+// V5.1.8.3 — comparación robusta de precios al tick.
 // Un trade un tick o más allá de la LIMIT cuenta como cross-through.
 const PRICE_EPSILON = TICK / 2;
 
@@ -153,7 +211,7 @@ const PROCESS_STARTED_AT_MS = Date.now();
 const liveTradesSinceProcessStart = [];
 
 // ============================================================
-// V5.1.8 — STRICT CAUSAL FILL AUDIT
+// V5.1.8.3 — STRICT CAUSAL FILL AUDIT
 // ============================================================
 // Un trade puede alimentar métricas aunque venga de REST/WS en lote,
 // pero solo puede llenar una orden si fue OBSERVADO después de que
@@ -245,34 +303,32 @@ const TEST_DURATION_MS = 24 * 60 * 60 * 1000;
 const LOOKBACK_MS = 5 * 60 * 1000;
 const MIN_DRAWDOWN = 0.0035;       // 0.35%
 const MAX_RANGE_POSITION = 0.45;   // estar en 45% inferior del rango reciente
-const MIN_RECENT_RANGE = 0.0045;   // rango >= 0.45%
 const MAX_LOW_AGE_MS = 3 * 60 * 1000;
 const COOLDOWN_MS = 15 * 1000;
 
 // ============================================================
-// V5.1.8 — EARLY ARM / MAKER PRIORITY
+// V5.1.8.3 — EARLY ARM / MAKER PRIORITY
 // ============================================================
 // La orden LIMIT se arma ANTES de exigir la señal completa.
 // Objetivo: que la orden ya esté descansando en el libro cuando
 // el precio llegue a la zona candidata. La señal dura sigue
 // calculándose y se registra cuando aparece, pero no esperamos
 // a ella para colocar la LIMIT.
-// V5.1.8: el EARLY ARM NO espera confirmación de FLOW 5m, drawdown ni rango duro.
+// V5.1.8.3: el EARLY ARM NO espera confirmación de FLOW 5m, drawdown ni rango duro.
 // Si ya existe una zona maker válida, cercana y debajo del mercado, la LIMIT
 // se arma inmediatamente para ganar prioridad temporal en el libro.
 const EARLY_ARM_MIN_DISTANCE = 0.0002;       // BUY al menos 0.02% debajo del último trade
-const EARLY_ARM_MAX_DISTANCE = 0.0060;       // no armar >0.60% por debajo del mercado
 
 // ============================================================
-// V4.8 — ESTRUCTURA 60 MIN / SOPORTE AUTOMÁTICO (DOWNSIDE)
+// V5.2.0 — ESTRUCTURA 60/120 MIN / SOPORTE AUTOMÁTICO
 // ============================================================
 
 // No hay niveles PEARL escritos a mano.
 // Reconstruimos velas de 1 minuto con trades de los últimos 60 min.
-// El motor todavía detecta pivotes de ambos lados internamente, pero V4.8
-// SOLO usa el soporte inferior para gestión de riesgo; los máximos/resistencias
-// NO bloquean entradas ni repricing.
+// El motor detecta pivotes de ambos lados; el soporte inferior guía entrada y
+// riesgo, mientras máximos/resistencias siguen siendo contexto.
 const STRUCTURE_WINDOW_MS = 60 * 60 * 1000;
+const STRUCTURE_ANALYSIS_WINDOW_MS = 120 * 60 * 1000;
 const STRUCTURE_BUCKET_MS = 60 * 1000;
 const STRUCTURE_PIVOT_RADIUS = 2;
 const STRUCTURE_MIN_BUCKETS = 12;
@@ -290,6 +346,7 @@ const STRUCTURE_MAX_RANGE_POSITION = 0.70;
 // Parámetro heredado del analizador de zonas. En V4.8 una resistencia
 // alcista nunca bloquea el scalping.
 const STRUCTURE_BREAKOUT_CONFIRM_PCT = 0.0010;
+const STRUCTURE_REBOUND_CONFIRM_PCT = 0.0020; // 0.20% fuera de la zona
 
 // Parámetros heredados del analizador de zonas; no se usan para vetar BUYs
 // ni reprices en V4.8.
@@ -298,7 +355,7 @@ const RESISTANCE_BUFFER_MAX_PCT = 0.0015;
 const RESISTANCE_BUFFER_SPREAD_FACTOR = 0.50;
 
 // ============================================================
-// V5.1.8 — 24H RANGE + DOWNSIDE STRUCTURAL STOP
+// V5.1.8.3 — 24H RANGE + DOWNSIDE STRUCTURAL STOP
 // ============================================================
 
 // HIGH 24h = contexto, nunca una resistencia que bloquee una subida.
@@ -316,10 +373,10 @@ const STRUCTURAL_STOP_MIN_DROP_30S = 0.0010;   // momentum30 <= -0.10%
 const BUY_TTL_MS = 90 * 1000;
 
 // ============================================================
-// V5.1.8 — STATIC EARLY-ARM BUY ATTEMPT
+// V5.2.0 — SUPPORT-ANCHORED EARLY-ARM BUY ATTEMPT
 // ============================================================
 
-// La BUY permanece FIJA durante todo el intento.
+// La BUY permanece en el soporte calculado; solo se rearma si el soporte baja.
 // NO se persigue el precio hacia arriba.
 // Si no llena dentro de 90 s, se cancela la idea y el bot
 // vuelve a WAITING para recalcular una señal nueva desde cero.
@@ -330,7 +387,7 @@ const BUY_TTL_MS = 90 * 1000;
 // FILL MODEL
 // ============================================================
 
-// V5.1.8: en toque exacto exigimos cola + tamaño propio, sin 10% extra.
+// V5.1.8.3: en toque exacto exigimos cola + tamaño propio, sin 10% extra.
 // Si el mercado ATRAVIESA la LIMIT, el fill es inmediato y este factor no aplica.
 const FILL_SAFETY = 1.00;
 
@@ -344,7 +401,7 @@ const FAST_FLOW_WINDOW_MS = 30 * 1000;
 // Para ABRIR una señal nueva seguimos usando contexto de 5 min.
 const MAX_ASK_SHARE_FOR_ENTRY = 0.62;
 
-// V5.1.8 — INVALIDACIÓN DE BUY PENDIENTE
+// V5.1.8.3 — INVALIDACIÓN DE BUY PENDIENTE
 //
 // Tocar o cruzar ligeramente nuestra BUY NO invalida la idea.
 // Eso es justamente la zona donde queremos ser llenados.
@@ -371,7 +428,7 @@ const STOP_MIN_HOLD_MS = 2 * 60 * 1000;
 // PROFIT FLOOR
 // ============================================================
 
-// V5.1.8: el stop defensivo normal protege el principal COMPLETO del
+// V5.1.8.3: el stop defensivo normal protege el principal COMPLETO del
 // SCALP_BUCKET activo. Una ruptura estructural tampoco vende: migra a recovery.
 // -10% en recovery SOLO arma RECOVERY_DANGER. El escape con pérdida requiere
 // ruptura confirmada del low24hAnchor (1.5% + 2 min + presión vendedora + no reclaim).
@@ -426,6 +483,18 @@ function roundDown(price) {
   return Number((Math.floor(price / TICK) * TICK).toFixed(4));
 }
 
+function targetPriceForEntry(entryPrice) {
+  const price = Number(entryPrice);
+  if (!Number.isFinite(price) || price <= 0) return null;
+  return roundUp(price + currentTargetPriceDelta());
+}
+
+function targetPctForEntry(entryPrice) {
+  const price = Number(entryPrice);
+  if (!Number.isFinite(price) || price <= 0) return null;
+  return currentTargetPriceDelta() / price;
+}
+
 function localClock(ms = Date.now()) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: TIMEZONE,
@@ -458,7 +527,7 @@ function initialState() {
   const now = Date.now();
 
   return {
-    version: "5.1.8",
+    version: "5.2.0",
 
     startedAt: iso(now),
     startedAtMs: now,
@@ -470,9 +539,18 @@ function initialState() {
 
     capitalStart: START_CAPITAL,
     capitalContributed: START_CAPITAL,
+    targetPriceDelta: DEFAULT_TARGET_PRICE_DELTA,
+    operatingBank: START_CAPITAL,
     cash: START_CAPITAL,
     pearl: 0,
     mode: "WAITING",
+
+    // V5.2.0 — control global del motor.
+    // RUNNING = entradas automáticas habilitadas.
+    // PAUSED = no crea nuevas BUY; posiciones abiertas siguen gestionándose.
+    tradingEnabled: true,
+    tradingPausedAt: null,
+    tradingResumedAt: iso(now),
 
     // Posiciones atrapadas separadas del capital operativo.
     recoveryPositions: [],
@@ -483,6 +561,10 @@ function initialState() {
     realizedProfit: 0,
 
     buyOrder: null,
+    scalpPositions: [],
+    scalpPositionsOpened: 0,
+    positionSpacingBlocks: 0,
+    // Vista legacy para dashboard existente; apunta al primer scalp abierto.
     position: null,
     sellOrder: null,
 
@@ -496,7 +578,7 @@ function initialState() {
     buyOrdersFilled: 0,
     buyOrdersExpired: 0,
 
-    // V5.1.8: LIMIT colocadas mediante armado anticipado.
+    // V5.1.8.3: LIMIT colocadas mediante armado anticipado.
     earlyBuyOrdersArmed: 0,
     hardSignalsConfirmedWhileArmed: 0,
 
@@ -519,7 +601,7 @@ function initialState() {
     // habría dejado el capital por debajo del piso protegido.
     capitalFloorBlockedStops: 0,
 
-    // V5.1.8: ruptura estructural inicia recovery; ya no vende inmediatamente.
+    // V5.1.8.3: ruptura estructural inicia recovery; ya no vende inmediatamente.
     structuralStopExits: 0,
     recoveryHoldsStarted: 0,
     recoveryBreakEvenExits: 0,
@@ -530,12 +612,16 @@ function initialState() {
     breakdownLocksCreated: 0,
     breakdownLocksReleased: 0,
 
-    // V5.1.8 — régimen de agotamiento / lock de caída.
+    // V5.1.8.3 — régimen de agotamiento / lock de caída.
     fallingMarketLock: null,
     fallingMarketLocksCreated: 0,
     fallingMarketLocksReleased: 0,
     fallingMarketEntriesBlocked: 0,
-    highRangeCautionOrders: 0
+    highRangeCautionOrders: 0,
+    supportCautionOrders: 0,
+    softFallingCautionOrders: 0,
+    entryStabilityBlocks: 0,
+    entryStabilityCancels: 0
   };
 }
 
@@ -545,9 +631,17 @@ if (fs.existsSync(STATE_FILE)) {
   try {
     const previous = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
 
-    if (previous.version === "5.1.8") {
+    if (previous.version === "5.2.0") {
       state = previous;
-      console.log("♻️ Reanudando V5.1.8 existente");
+      console.log("♻️ Reanudando estado V5.2.0 (misma carpeta/runtime)");
+    } else if (["5.1.8.3.1", "5.1.8.3", "5.1.8.2", "5.1.8.1", "5.1.8"].includes(previous.version)) {
+      // El bank cambió de 100 a 10,000 USDT. No mezclamos el balance/counters
+      // de la sesión legacy con la nueva sesión de operación. Guardamos backup.
+      const backup = path.join(DIR, `state.pre-v5.2.0-${Date.now()}.json`);
+      fs.copyFileSync(STATE_FILE, backup);
+      state = initialState();
+      console.log(`🆕 V5.2.0 inicia bank fresco de ${START_CAPITAL} USDT.`);
+      console.log(`🗃️ Estado legacy preservado en: ${backup}`);
     }
   } catch (error) {
     console.log("No pude cargar state.json:", error.message);
@@ -556,6 +650,12 @@ if (fs.existsSync(STATE_FILE)) {
 
 function normalizeV515State() {
   state.capitalContributed = Number(state.capitalContributed ?? START_CAPITAL);
+  state.targetPriceDelta = Number.isFinite(Number(state.targetPriceDelta)) && Number(state.targetPriceDelta) > 0
+    ? Number(state.targetPriceDelta)
+    : DEFAULT_TARGET_PRICE_DELTA;
+  state.operatingBank = Number.isFinite(Number(state.operatingBank)) && Number(state.operatingBank) > 0
+    ? Number(state.operatingBank)
+    : START_CAPITAL;
   state.recoveryPositions = Array.isArray(state.recoveryPositions) ? state.recoveryPositions : [];
   state.breakdownLocks = Array.isArray(state.breakdownLocks) ? state.breakdownLocks : [];
   state.capitalInjections = Array.isArray(state.capitalInjections) ? state.capitalInjections : [];
@@ -578,11 +678,106 @@ function normalizeV515State() {
   state.fallingMarketLocksReleased = Number(state.fallingMarketLocksReleased || 0);
   state.fallingMarketEntriesBlocked = Number(state.fallingMarketEntriesBlocked || 0);
   state.highRangeCautionOrders = Number(state.highRangeCautionOrders || 0);
+  state.supportCautionOrders = Number(state.supportCautionOrders || 0);
+  state.softFallingCautionOrders = Number(state.softFallingCautionOrders || 0);
+  state.entryStabilityBlocks = Number(state.entryStabilityBlocks || 0);
+  state.entryStabilityCancels = Number(state.entryStabilityCancels || 0);
+  state.scalpPositions = Array.isArray(state.scalpPositions) ? state.scalpPositions : [];
+  state.scalpPositionsOpened = Number(state.scalpPositionsOpened || 0);
+  state.positionSpacingBlocks = Number(state.positionSpacingBlocks || 0);
+  state.tradingEnabled = state.tradingEnabled !== false;
+  state.tradingPausedAt = state.tradingPausedAt ?? null;
+  state.tradingResumedAt = state.tradingResumedAt ?? null;
+
+  // Migración transparente desde 5.1.8.2/5.1.8.1.
+  if (!state.scalpPositions.length && state.position) {
+    state.scalpPositionsOpened += 1;
+    state.scalpPositions.push({
+      ...state.position,
+      id: state.position.id || `scalp-migrated-${Date.now()}-${state.scalpPositionsOpened}`,
+      sellOrder: state.sellOrder || state.position.sellOrder || null
+    });
+  }
+
+  for (const position of state.scalpPositions) {
+    if (!position.id) {
+      state.scalpPositionsOpened += 1;
+      position.id = `scalp-${Date.now()}-${state.scalpPositionsOpened}`;
+    }
+    if (!position.sellOrder && state.scalpPositions.length === 1 && state.sellOrder) {
+      position.sellOrder = state.sellOrder;
+    }
+  }
+
+  syncLegacyScalpView();
 }
 
 normalizeV515State();
+saveState();
+
+function currentTargetPriceDelta() {
+  const value = Number(state.targetPriceDelta);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_TARGET_PRICE_DELTA;
+}
+
+function currentOperatingBank() {
+  const value = Number(state.operatingBank);
+  return Number.isFinite(value) && value > 0 ? value : START_CAPITAL;
+}
+
+function openScalpPositions() {
+  return Array.isArray(state.scalpPositions) ? state.scalpPositions : [];
+}
+
+function scalpCostBasis() {
+  return (Number(state.cash) || 0) + openScalpPositions().reduce(
+    (sum, p) => sum + (Number(p.investedUSDT) || 0),
+    0
+  );
+}
+
+function syncLegacyScalpView() {
+  const positions = Array.isArray(state.scalpPositions) ? state.scalpPositions : [];
+  state.pearl = positions.reduce((sum, p) => sum + (Number(p.pearlReceived) || 0), 0);
+  state.position = positions[0] || null;
+  state.sellOrder = positions[0]?.sellOrder || null;
+  state.mode = state.buyOrder ? "BUY_LIMIT" : positions.length ? "SELL_LIMIT" : "WAITING";
+}
+
+function positionSpacingContext(candidatePrice) {
+  const price = Number(candidatePrice);
+  if (!Number.isFinite(price) || price <= 0) {
+    return { ok: false, nearestEntry: null, nearestDistancePct: null, reason: "INVALID_CANDIDATE_PRICE" };
+  }
+
+  const refs = [
+    ...openScalpPositions().map((p) => ({ id: p.id, type: "SCALP", entryPrice: Number(p.entryPrice) })),
+    ...state.recoveryPositions.map((p) => ({ id: p.id, type: "RECOVERY", entryPrice: Number(p.entryPrice) }))
+  ].filter((x) => Number.isFinite(x.entryPrice) && x.entryPrice > 0);
+
+  if (!refs.length) {
+    return { ok: true, nearestEntry: null, nearestDistancePct: null, nearestPositionId: null, nearestType: null, reason: null };
+  }
+
+  let nearest = null;
+  for (const ref of refs) {
+    const distancePct = Math.abs(price / ref.entryPrice - 1);
+    if (!nearest || distancePct < nearest.distancePct) nearest = { ...ref, distancePct };
+  }
+
+  const ok = nearest.distancePct + 1e-12 >= MIN_POSITION_SPACING_PCT;
+  return {
+    ok,
+    nearestEntry: nearest.entryPrice,
+    nearestDistancePct: nearest.distancePct,
+    nearestPositionId: nearest.id,
+    nearestType: nearest.type,
+    reason: ok ? null : "TOO_CLOSE_TO_OPEN_POSITION"
+  };
+}
 
 function saveState() {
+  syncLegacyScalpView();
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
 }
 
@@ -811,7 +1006,19 @@ function marketSpreadObserved() {
 // MARKET SELL SIMULATION
 // ============================================================
 
-function simulateMarketSell(pearlAmount) {
+function buyFeeUSDT(position) {
+  const explicit = Number(position?.buyFeeUSDT);
+  if (Number.isFinite(explicit) && explicit >= 0) return explicit;
+
+  const invested = Number(position?.investedUSDT);
+  return Number.isFinite(invested) && invested >= 0 ? invested * BUY_FEE : 0;
+}
+
+function netSellProceeds(position, grossUSDT) {
+  return grossUSDT * (1 - SELL_FEE) - buyFeeUSDT(position);
+}
+
+function simulateMarketSell(pearlAmount, buyFee = 0) {
   let remaining = pearlAmount;
   let grossUSDT = 0;
   let filledPearl = 0;
@@ -837,7 +1044,7 @@ function simulateMarketSell(pearlAmount) {
   return {
     avgPrice,
     grossUSDT,
-    netUSDT: grossUSDT * (1 - SELL_FEE)
+    netUSDT: grossUSDT * (1 - SELL_FEE) - Math.max(0, Number(buyFee) || 0)
   };
 }
 
@@ -875,7 +1082,7 @@ function trimHistory(newestTime) {
   const keepWindow = Math.max(
     LOOKBACK_MS,
     FLOW_WINDOW_MS,
-    STRUCTURE_WINDOW_MS
+    STRUCTURE_ANALYSIS_WINDOW_MS
   );
   const cutoff = newestTime - keepWindow;
 
@@ -961,7 +1168,7 @@ function priceMomentum(now = Date.now(), windowMs = FAST_FLOW_WINDOW_MS) {
 }
 
 // ============================================================
-// V5.1.8 — MARKET REFERENCE / SPARSE-TRADE FALLBACK
+// V5.1.8.3 — MARKET REFERENCE / SPARSE-TRADE FALLBACK
 // ============================================================
 // El EARLY_ARM no debe quedarse paralizado solo porque en los últimos 5 min
 // haya menos de 10 ejecuciones. Para decidir dónde DEJAR una LIMIT podemos usar
@@ -1111,7 +1318,7 @@ function metrics() {
 }
 
 // ============================================================
-// V5.1.8 — MULTI-WINDOW MARKET STATE (10m / 5m / 30s)
+// V5.1.8.3 — MULTI-WINDOW MARKET STATE (10m / 5m / 30s)
 // ============================================================
 
 function tradeWindowStats(windowMs, endOffsetMs = 0, now = Date.now()) {
@@ -1188,7 +1395,7 @@ function highRangeCautionContext(metric = null) {
   const sellPressure = flow5.askShare !== null && flow5.askShare >= HIGH_RANGE_CAUTION_ASK_SHARE;
   const microDrop = mom30.move !== null && mom30.move <= -HIGH_RANGE_CAUTION_MICRO_DROP;
   const exhaustionVotes = [pullback, lowerHigh, sellPressure, microDrop].filter(Boolean).length;
-  // V5.1.8: 24h high-range ya NO es requisito. Una subida fuerte con 2 señales
+  // V5.1.8.3: 24h high-range ya NO es requisito. Una subida fuerte con 2 señales
   // de agotamiento activa cautela aunque esté, por ejemplo, en 70–80% del rango.
   // Si además está >=85%, una sola señal de agotamiento basta como precaución.
   const active = strongRun && (
@@ -1230,6 +1437,11 @@ function liveTradeWindowStats(windowMs, now = Date.now()) {
   const last = prices[prices.length - 1];
   const low = Math.min(...prices);
   const high = Math.max(...prices);
+  let lowTrade = null;
+  for (const trade of trades) {
+    if (!Number.isFinite(trade.price)) continue;
+    if (!lowTrade || trade.price <= lowTrade.price) lowTrade = trade;
+  }
   return {
     ready: true,
     samples: prices.length,
@@ -1238,7 +1450,84 @@ function liveTradeWindowStats(windowMs, now = Date.now()) {
     low,
     high,
     move: first > 0 ? last / first - 1 : null,
-    rangePct: low > 0 ? (high - low) / low : null
+    rangePct: low > 0 ? (high - low) / low : null,
+    lowObservedAtMs: Number.isFinite(lowTrade?.observedAtMs) ? lowTrade.observedAtMs : null,
+    lowAgeMs: Number.isFinite(lowTrade?.observedAtMs) ? Math.max(0, now - lowTrade.observedAtMs) : null
+  };
+}
+
+function entryStabilityContext(referencePrice = null) {
+  const now = Date.now();
+  const current = Number.isFinite(referencePrice)
+    ? referencePrice
+    : (marketReferencePrice()?.price ?? null);
+  const w15 = liveTradeWindowStats(ENTRY_STABILITY_WINDOW_MS, now);
+  const w10 = liveTradeWindowStats(10 * 60 * 1000, now);
+  const w5 = liveTradeWindowStats(5 * 60 * 1000, now);
+  const mom30 = priceMomentum(now, 30 * 1000);
+  const flow5 = flowMetrics(now, 5 * 60 * 1000);
+
+  const dropFromHigh15m = w15.ready && Number.isFinite(current) && Number.isFinite(w15.high) && current > 0
+    ? w15.high / current - 1
+    : null;
+
+  const required = Boolean(
+    (dropFromHigh15m !== null && dropFromHigh15m >= ENTRY_STABILITY_DROP_FROM_HIGH_15M) ||
+    (w10.ready && w10.move !== null && w10.move <= -ENTRY_STABILITY_DROP_10M) ||
+    (w5.ready && w5.move !== null && w5.move <= -ENTRY_STABILITY_DROP_5M)
+  );
+
+  // Preferimos el low de 10m para no declarar estabilidad por un rebote muy corto.
+  const lowAgeMs = Number.isFinite(w10.lowAgeMs)
+    ? w10.lowAgeMs
+    : (Number.isFinite(w5.lowAgeMs) ? w5.lowAgeMs : null);
+
+  const noNewLowLongEnough = !required ||
+    (Number.isFinite(lowAgeMs) && lowAgeMs >= ENTRY_STABILITY_MIN_LOW_AGE_MS);
+  const tenMinuteNotFalling = !required ||
+    (w10.ready && w10.move !== null && w10.move >= -ENTRY_STABILITY_MAX_DROP_10M);
+  const fiveMinuteNotFalling = !required ||
+    (w5.ready && w5.move !== null && w5.move >= -ENTRY_STABILITY_MAX_DROP_5M);
+  const microNotFalling = !required ||
+    mom30.move === null || mom30.move >= -ENTRY_STABILITY_MAX_DROP_30S;
+  const sellPressureContained = !required ||
+    flow5.askShare === null || flow5.askShare <= ENTRY_STABILITY_MAX_ASK_SHARE_5M;
+  const bounceFromLow5m = w5.ready && Number.isFinite(current) && Number.isFinite(w5.low) && w5.low > 0
+    ? current / w5.low - 1
+    : null;
+  const bounceOrTight = !required || Boolean(
+    (bounceFromLow5m !== null && bounceFromLow5m >= ENTRY_STABILITY_MIN_BOUNCE_FROM_LOW_5M) ||
+    (w5.ready && w5.rangePct !== null && w5.rangePct <= ENTRY_STABILITY_TIGHT_RANGE_5M)
+  );
+
+  const conditions = {
+    noNewLowLongEnough,
+    tenMinuteNotFalling,
+    fiveMinuteNotFalling,
+    microNotFalling,
+    sellPressureContained,
+    bounceOrTight
+  };
+
+  const stableEnough = !required || Object.values(conditions).every(Boolean);
+  return {
+    ok: stableEnough,
+    required,
+    stableEnough,
+    conditions,
+    failedConditions: required ? failedConditionNames(conditions) : [],
+    current,
+    dropFromHigh15m,
+    move10m: w10.move ?? null,
+    move5m: w5.move ?? null,
+    momentum30s: mom30.move ?? null,
+    askShare5m: flow5.askShare,
+    bounceFromLow5m,
+    lowAgeMs,
+    minutesSinceLow: Number.isFinite(lowAgeMs) ? lowAgeMs / 60000 : null,
+    low5m: w5.low ?? null,
+    low10m: w10.low ?? null,
+    high15m: w15.high ?? null
   };
 }
 
@@ -1250,14 +1539,54 @@ function preEntryFallingContext(referencePrice = null) {
   const w4 = liveTradeWindowStats(4 * 60 * 1000, now);
   const w5 = liveTradeWindowStats(5 * 60 * 1000, now);
   const w10 = liveTradeWindowStats(10 * 60 * 1000, now);
+  const w15 = liveTradeWindowStats(15 * 60 * 1000, now);
   const flow5 = flowMetrics(now, 5 * 60 * 1000);
   const mom30 = priceMomentum(now, 30 * 1000);
 
-  const directionalDrop = Boolean(
-    (w4.ready && w4.move !== null && w4.move <= -PREENTRY_FALLING_MOVE_4M) ||
-    (w5.ready && w5.move !== null && w5.move <= -PREENTRY_FALLING_MOVE_5M) ||
-    (w10.ready && w10.move !== null && w10.move <= -PREENTRY_FALLING_MOVE_10M)
+  const dropFromHigh15m = Boolean(
+    w15.ready && Number.isFinite(current) && Number.isFinite(w15.high) && current > 0
+  )
+    ? w15.high / current - 1
+    : null;
+
+  const softDirectionalDrop = Boolean(
+    (w4.ready && w4.move !== null && w4.move <= -SOFT_FALLING_MOVE_4M) ||
+    (w5.ready && w5.move !== null && w5.move <= -SOFT_FALLING_MOVE_5M) ||
+    (w10.ready && w10.move !== null && w10.move <= -SOFT_FALLING_MOVE_10M)
   );
+
+  const nearLow10m = Boolean(
+    w10.ready && Number.isFinite(current) && Number.isFinite(w10.low) &&
+    current / w10.low - 1 <= HARD_SLOW_BLEED_NEAR_LOW_PCT
+  );
+  const recentMeaningfulLow = Boolean(
+    Number.isFinite(w10.lowAgeMs) &&
+    w10.lowAgeMs <= HARD_SLOW_BLEED_RECENT_LOW_MS &&
+    nearLow10m
+  );
+
+  const hardShock = Boolean(
+    (w5.ready && w5.move !== null && w5.move <= -HARD_FALLING_MOVE_5M) ||
+    (w10.ready && w10.move !== null && w10.move <= -HARD_FALLING_MOVE_10M) ||
+    (dropFromHigh15m !== null && dropFromHigh15m >= HARD_FALLING_DROP_FROM_HIGH_15M) ||
+    (
+      mom30.move !== null &&
+      mom30.move <= -HARD_FALLING_MOMENTUM_30S &&
+      w5.ready &&
+      w5.move !== null &&
+      w5.move <= -HARD_FALLING_MOMENTUM_CONFIRM_MOVE_5M
+    )
+  );
+
+  const hardSlowBleed = Boolean(
+    w5.ready && w5.move !== null && w5.move <= -HARD_SLOW_BLEED_MOVE_5M &&
+    w10.ready && w10.move !== null && w10.move <= -HARD_SLOW_BLEED_MOVE_10M &&
+    recentMeaningfulLow
+  );
+
+  const hardLock = hardShock || hardSlowBleed;
+  const softCaution = !hardLock && softDirectionalDrop;
+
   const pulledFromHigh = Boolean(
     w5.ready && Number.isFinite(current) && Number.isFinite(w5.high) &&
     w5.high / current - 1 >= PREENTRY_FALLING_PULLBACK_FROM_HIGH_5M
@@ -1268,27 +1597,43 @@ function preEntryFallingContext(referencePrice = null) {
     w5.ready && Number.isFinite(current) && Number.isFinite(w5.low) &&
     current / w5.low - 1 <= PREENTRY_FALLING_NEAR_LOW_PCT
   );
-
   const confirmingVotes = [pulledFromHigh, sellPressure, microDrop, nearLow].filter(Boolean).length;
-  const active = directionalDrop && confirmingVotes >= 1;
+
+  const regime = hardLock
+    ? "HARD_FALLING_LOCK"
+    : softCaution
+      ? "SOFT_FALLING_CONTEXT"
+      : "NORMAL_SCALP";
 
   return {
-    active,
+    // Compatibilidad: active ahora significa que existe un HARD lock pre-entry.
+    active: hardLock,
+    regime,
+    hardLock,
+    hardShock,
+    hardSlowBleed,
+    softCaution,
+    softDirectionalDrop,
     current,
-    directionalDrop,
+    directionalDrop: softDirectionalDrop || hardLock,
     confirmingVotes,
     pulledFromHigh,
     sellPressure,
     microDrop,
     nearLow,
+    recentMeaningfulLow,
+    nearLow10m,
+    dropFromHigh15m,
     move4m: w4.move ?? null,
     move5m: w5.move ?? null,
     move10m: w10.move ?? null,
+    momentum30s: mom30.move ?? null,
+    lowAge10mMs: w10.lowAgeMs ?? null,
+    minutesSinceLow10m: Number.isFinite(w10.lowAgeMs) ? w10.lowAgeMs / 60000 : null,
     liveSamples4m: w4.samples ?? 0,
     liveSamples5m: w5.samples ?? 0,
     liveSamples10m: w10.samples ?? 0,
-    askShare5m: flow5.askShare,
-    momentum30s: mom30.move
+    askShare5m: flow5.askShare
   };
 }
 
@@ -1299,6 +1644,7 @@ function startupContextStatus(referencePrice = null) {
   const timeReady = elapsedMs >= STARTUP_CONTEXT_LOCK_MS;
   const samplesReady = liveTrades >= STARTUP_CONTEXT_MIN_LIVE_TRADES;
   const falling = preEntryFallingContext(referencePrice);
+  const entryStability = entryStabilityContext(referencePrice);
 
   return {
     locked: !(timeReady && samplesReady),
@@ -1309,21 +1655,28 @@ function startupContextStatus(referencePrice = null) {
     minimumLiveTrades: STARTUP_CONTEXT_MIN_LIVE_TRADES,
     timeReady,
     samplesReady,
-    falling
+    falling,
+    entryStability
   };
 }
 
 function maybeActivatePreEntryFallingLock(referencePrice = null) {
   if (activeFallingMarketLock()) return false;
   const startup = startupContextStatus(referencePrice);
-  if (!startup.ready || !startup.falling.active) return false;
+  if (!startup.ready) return false;
   if (!Number.isFinite(referencePrice) || referencePrice <= 0) return false;
+
+  // V5.1.8.3: SOLO el régimen HARD crea un lock real.
+  // SOFT_FALLING_CONTEXT continúa operando; el sizing reducido solo lo decide el soporte cercano.
+  if (!startup.falling?.hardLock) return false;
 
   activateFallingMarketLock({
     recoveryId: null,
     triggerPrice: referencePrice,
     brokenSupport: null,
-    triggerReason: "PREENTRY_FALLING_MARKET"
+    triggerReason: startup.falling?.hardSlowBleed
+      ? "PREENTRY_HARD_SLOW_BLEED"
+      : "PREENTRY_HARD_FALLING_MARKET"
   });
   return true;
 }
@@ -1382,7 +1735,7 @@ function rangePositionEntryContext(referencePrice = null) {
   }
 
   if (rangePosition24h > RANGE_FULL_CAPITAL_MAX_24H_POSITION) {
-    return { ready: true, ok: true, rangePosition24h, mode: "UPPER_RANGE_CAUTION", fraction: RANGE_CAUTION_CAPITAL_FRACTION, reason: null };
+    return { ready: true, ok: true, rangePosition24h, mode: "UPPER_RANGE_CAUTION", fraction: 1.0, reason: null };
   }
 
   return { ready: true, ok: true, rangePosition24h, mode: "NORMAL_SCALP", fraction: 1.0, reason: null };
@@ -1392,31 +1745,64 @@ function entryZoneContext(buyPrice = null, metric = null) {
   const ladder = priceLadderEntryContext(buyPrice);
   const range = rangePositionEntryContext(buyPrice);
   const exhaustion = highRangeCautionContext(metric);
-  return { ok: Boolean(ladder.ok && range.ok), ladder, range, exhaustion };
+  const current = Number.isFinite(Number(metric?.current))
+    ? Number(metric.current)
+    : buyPrice;
+  const supportEntry = supportEntryContext(current);
+  const supportEntryOK = Number.isFinite(Number(buyPrice)) &&
+    supportEntry.ok &&
+    Number(buyPrice) >= supportEntry.lower - TICK &&
+    Number(buyPrice) <= supportEntry.upper + TICK;
+
+  return {
+    ok: Boolean((ladder.ok && range.ok) || supportEntryOK),
+    supportEntryOK,
+    supportEntry,
+    ladder,
+    range,
+    exhaustion
+  };
 }
 
 function scalpAllocation(signal = null) {
-  const available = Math.max(0, Number(state.cash) || 0);
+  const deployed = openScalpPositions().reduce(
+    (sum, position) => sum + (Number(position.investedUSDT) || 0),
+    0
+  );
+  const availableCash = Math.max(0, Number(state.cash) || 0);
+  const available = Math.min(availableCash, Math.max(0, currentOperatingBank() - deployed));
   const zone = entryZoneContext(signal?.buyPrice ?? null, signal?.metric ?? null);
+  const falling = preEntryFallingContext(signal?.metric?.current ?? null);
+  const supportCaution = supportProximityContext(signal?.buyPrice ?? null);
 
-  // El tier de rango manda. Exhaustion solo puede REDUCIR, nunca devolver 100%.
-  let fraction = zone.range.ok ? zone.range.fraction : 0;
-  if (zone.exhaustion.active && fraction > 0) {
-    fraction = Math.min(fraction, HIGH_RANGE_CAUTION_CAPITAL_FRACTION);
-  }
+  // El bank completo es la regla base. Solo el soporte cercano reduce a 30%.
+  // Un soporte válido puede habilitar la entrada aunque el rango 24h esté alto.
+  let fraction = zone.ok ? 1.0 : 0;
+  if (supportCaution.near && fraction > 0) fraction = SUPPORT_CAUTION_CAPITAL_FRACTION;
 
-  let mode = zone.range.mode;
-  if (zone.exhaustion.active && mode === "NORMAL_SCALP") mode = "EXHAUSTION_CAUTION";
-  if (!zone.ladder.ok) mode = "PRICE_LADDER_BLOCKED";
-  if (!zone.range.ok) mode = zone.range.mode;
+  let mode = zone.supportEntryOK && (!zone.range.ok || !zone.ladder.ok)
+    ? "SUPPORT_ENTRY"
+    : zone.range.mode;
+  if (supportCaution.near) mode = "SUPPORT_CAUTION";
+  else if (zone.exhaustion.active && mode === "NORMAL_SCALP") mode = "EXHAUSTION_CONTEXT";
+  else if (falling.softCaution && fraction > 0) mode = "SOFT_FALLING_CONTEXT";
+  if (!zone.ladder.ok && !zone.supportEntryOK) mode = "PRICE_LADDER_BLOCKED";
+  if (!zone.range.ok && !zone.supportEntryOK) mode = zone.range.mode;
 
-  const capital = available * fraction;
+  // Solo queda una BUY pendiente; con 100% base el cash evita solapamientos.
+  const regimeCapital = available * fraction;
+  const slotCap = Math.max(0, (currentOperatingBank() - deployed) * MULTI_POSITION_MAX_CAPITAL_FRACTION);
+  const capital = Math.min(available, regimeCapital, slotCap);
+
   return {
     mode,
     fraction,
     capital,
+    slotCap,
     reserveAfterFill: Math.max(0, available - capital),
     caution: zone.exhaustion,
+    falling,
+    supportCaution,
     zone
   };
 }
@@ -1489,35 +1875,73 @@ function fallingMarketStabilityContext(referencePrice = null) {
   const w5 = tradeWindowStats(5 * 60 * 1000);
   const mom30 = priceMomentum(now, 30 * 1000);
   const flow5 = flowMetrics(now, 5 * 60 * 1000);
+  const isPreEntryHardLock = String(lock.triggerReason || "").startsWith("PREENTRY_");
 
-  const minLockAgeOK = now - lock.createdAtMs >= FALLING_LOCK_MIN_MS;
-  const noNewLowLongEnough = now - Number(lock.lastMeaningfulNewLowAtMs || lock.createdAtMs) >= FALLING_LOCK_NO_NEW_LOW_MS;
-  const tenMinuteNotFalling = w10.ready && w10.move !== null && w10.move >= -STABILITY_MAX_DROP_10M;
-  const fiveMinuteNotFalling = w5.ready && w5.move !== null && w5.move >= -STABILITY_MAX_DROP_5M;
-  const microNotFalling = mom30.move === null || mom30.move >= -STABILITY_MAX_DROP_30S;
-  const sellPressureContained = flow5.askShare === null || flow5.askShare <= STABILITY_MAX_ASK_SHARE_5M;
-  const bounceOrTight = w5.ready && Number.isFinite(current) && Number.isFinite(w5.low)
-    ? (current / w5.low - 1 >= STABILITY_BOUNCE_FROM_LOW_5M) ||
-      (w5.rangePct !== null && w5.rangePct <= STABILITY_TIGHT_RANGE_5M)
-    : false;
+  const minAgeMs = isPreEntryHardLock ? PREENTRY_HARD_LOCK_MIN_MS : FALLING_LOCK_MIN_MS;
+  const noNewLowMs = isPreEntryHardLock ? PREENTRY_HARD_LOCK_NO_NEW_LOW_MS : FALLING_LOCK_NO_NEW_LOW_MS;
 
-  const conditions = {
-    minLockAgeOK,
-    noNewLowLongEnough,
-    tenMinuteNotFalling,
-    fiveMinuteNotFalling,
-    microNotFalling,
-    sellPressureContained,
-    bounceOrTight
-  };
+  const minLockAgeOK = now - lock.createdAtMs >= minAgeMs;
+  const noNewLowLongEnough =
+    now - Number(lock.lastMeaningfulNewLowAtMs || lock.createdAtMs) >= noNewLowMs;
+
+  const bounceFromLow5m = w5.ready && Number.isFinite(current) && Number.isFinite(w5.low)
+    ? current / w5.low - 1
+    : null;
+
+  let conditions;
+  let entryStability = entryStabilityContext(current);
+
+  if (isPreEntryHardLock) {
+    // V5.1.8.3: no retenemos el capital 5 minutos extra cuando el shock ya murió.
+    const fiveMinuteNotFalling =
+      w5.ready && w5.move !== null && w5.move >= -PREENTRY_HARD_RELEASE_MAX_DROP_5M;
+    const microNotFalling =
+      mom30.move === null || mom30.move >= -PREENTRY_HARD_RELEASE_MAX_DROP_30S;
+    const bounceOrRising = Boolean(
+      (bounceFromLow5m !== null && bounceFromLow5m >= PREENTRY_HARD_RELEASE_MIN_BOUNCE_5M) ||
+      (w5.ready && w5.move !== null && w5.move >= 0)
+    );
+
+    conditions = {
+      minLockAgeOK,
+      noNewLowLongEnough,
+      fiveMinuteNotFalling,
+      microNotFalling,
+      bounceOrRising
+    };
+  } else {
+    // RECOVERY conserva la salida conservadora previa.
+    const tenMinuteNotFalling = w10.ready && w10.move !== null && w10.move >= -STABILITY_MAX_DROP_10M;
+    const fiveMinuteNotFalling = w5.ready && w5.move !== null && w5.move >= -STABILITY_MAX_DROP_5M;
+    const microNotFalling = mom30.move === null || mom30.move >= -STABILITY_MAX_DROP_30S;
+    const sellPressureContained = flow5.askShare === null || flow5.askShare <= STABILITY_MAX_ASK_SHARE_5M;
+    const bounceOrTight = w5.ready && Number.isFinite(current) && Number.isFinite(w5.low)
+      ? (current / w5.low - 1 >= STABILITY_BOUNCE_FROM_LOW_5M) ||
+        (w5.rangePct !== null && w5.rangePct <= STABILITY_TIGHT_RANGE_5M)
+      : false;
+    const entryStabilityOK = entryStability.ok;
+
+    conditions = {
+      minLockAgeOK,
+      noNewLowLongEnough,
+      tenMinuteNotFalling,
+      fiveMinuteNotFalling,
+      microNotFalling,
+      sellPressureContained,
+      bounceOrTight,
+      entryStabilityOK
+    };
+  }
 
   return {
     active: true,
+    lockType: isPreEntryHardLock ? "PREENTRY_HARD" : "RECOVERY",
     stableEnough: Object.values(conditions).every(Boolean),
     conditions,
     failedConditions: failedConditionNames(conditions),
     lockAgeMinutes: (now - lock.createdAtMs) / 60000,
-    minutesSinceMeaningfulNewLow: (now - Number(lock.lastMeaningfulNewLowAtMs || lock.createdAtMs)) / 60000,
+    minutesSinceMeaningfulNewLow:
+      (now - Number(lock.lastMeaningfulNewLowAtMs || lock.createdAtMs)) / 60000,
     lowSinceLock: lock.lowSinceLock ?? null,
     low24AtLock: lock.low24AtLock ?? null,
     lowest24hObserved: lock.lowest24hObserved ?? null,
@@ -1530,9 +1954,8 @@ function fallingMarketStabilityContext(referencePrice = null) {
     askShare5m: flow5.askShare,
     low5m: w5.low ?? null,
     range5m: w5.rangePct ?? null,
-    bounceFromLow5m: w5.ready && Number.isFinite(current) && Number.isFinite(w5.low)
-      ? current / w5.low - 1
-      : null
+    bounceFromLow5m,
+    entryStability
   };
 }
 
@@ -1610,15 +2033,32 @@ function updateFallingMarketLock(referencePrice) {
   return changed;
 }
 
-function fallingMarketEntryGate() {
+function fallingMarketEntryGate(referencePrice = null) {
   const lock = activeFallingMarketLock();
-  if (!lock) return { ok: true, lockId: null };
+  const entryStability = entryStabilityContext(referencePrice);
+  const preEntry = preEntryFallingContext(referencePrice);
 
-  const stability = fallingMarketStabilityContext();
+  if (!lock) {
+    return {
+      ok: true,
+      lockId: null,
+      stability: null,
+      entryStability,
+      preEntry,
+      softCaution: preEntry.softCaution,
+      hardLock: false
+    };
+  }
+
+  const stability = fallingMarketStabilityContext(referencePrice);
   return {
     ok: false,
     lockId: lock.id,
-    stability
+    stability,
+    entryStability,
+    preEntry,
+    softCaution: false,
+    hardLock: true
   };
 }
 
@@ -1630,8 +2070,8 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-function structureMinuteCandles(now = Date.now()) {
-  const cutoff = now - STRUCTURE_WINDOW_MS;
+function structureMinuteCandles(now = Date.now(), windowMs = STRUCTURE_WINDOW_MS) {
+  const cutoff = now - windowMs;
   const currentBucket =
     Math.floor(now / STRUCTURE_BUCKET_MS) * STRUCTURE_BUCKET_MS;
 
@@ -1762,12 +2202,12 @@ function resistanceSafetyBufferPct() {
   );
 }
 
-function structure60m(referencePrice = null) {
+function structureForWindow(referencePrice = null, windowMs = STRUCTURE_WINDOW_MS, windowLabel = "60M") {
   const now = Date.now();
-  const candles = structureMinuteCandles(now);
+  const candles = structureMinuteCandles(now, windowMs);
 
   const windowTrades = recentTrades
-    .filter((trade) => trade.time >= now - STRUCTURE_WINDOW_MS)
+    .filter((trade) => trade.time >= now - windowMs)
     .filter((trade) => Number.isFinite(trade.price));
 
   const prices = windowTrades.map((trade) => trade.price);
@@ -1793,24 +2233,26 @@ function structure60m(referencePrice = null) {
   ) {
     return {
       ready: false,
-      reason: "INSUFFICIENT_60M_HISTORY",
+      reason: `INSUFFICIENT_${windowLabel}_HISTORY`,
       mode: "INSUFFICIENT_HISTORY_FALLBACK",
       bucketCount: candles.length,
       current,
       support: null,
       resistance: null,
       brokenResistance: null,
+      supports: [],
+      resistances: [],
       clusterTolerancePct: null,
       clusterToleranceAbs: null
     };
   }
 
-  const high60m = Math.max(...prices);
-  const low60m = Math.min(...prices);
-  const rangePct60m = low60m > 0 ? high60m / low60m - 1 : 0;
+  const high = Math.max(...prices);
+  const low = Math.min(...prices);
+  const rangePct = low > 0 ? high / low - 1 : 0;
 
   const clusterPct = clamp(
-    rangePct60m * STRUCTURE_CLUSTER_RANGE_FACTOR,
+    rangePct * STRUCTURE_CLUSTER_RANGE_FACTOR,
     STRUCTURE_CLUSTER_MIN_PCT,
     STRUCTURE_CLUSTER_MAX_PCT
   );
@@ -1894,18 +2336,266 @@ function structure60m(referencePrice = null) {
     mode,
     bucketCount: candles.length,
     current,
-    high60m,
-    low60m,
-    rangePct60m,
+    high,
+    low,
+    rangePct,
     clusterTolerancePct: clusterPct,
     clusterToleranceAbs: toleranceAbs,
     pivotHighCount: pivots.highs.length,
     pivotLowCount: pivots.lows.length,
     highZoneCount: highClusters.length,
     lowZoneCount: lowClusters.length,
+    supports: lowClusters,
+    resistances: highClusters,
     support,
     resistance,
     brokenResistance
+  };
+}
+
+function structure60m(referencePrice = null) {
+  const structure = structureForWindow(referencePrice, STRUCTURE_WINDOW_MS, "60M");
+  return {
+    ...structure,
+    high60m: structure.high ?? null,
+    low60m: structure.low ?? null,
+    rangePct60m: structure.rangePct ?? null
+  };
+}
+
+function observeStructureZones(zones, trades, type) {
+  return zones.map((zone) => {
+    let inside = false;
+    let previousPrice = null;
+    let observedTouches = 0;
+    let rebounds = 0;
+    let lastTouchAt = null;
+    let lastReboundAt = null;
+
+    for (const trade of trades) {
+      const price = trade.price;
+      const inZone = price >= zone.lower && price <= zone.upper;
+      const crossedZone = previousPrice !== null && (
+        previousPrice < zone.lower && price > zone.upper ||
+        previousPrice > zone.upper && price < zone.lower
+      );
+
+      if (!inside && (inZone || crossedZone)) {
+        inside = true;
+        observedTouches++;
+        lastTouchAt = trade.time;
+      }
+
+      if (inside) {
+        const confirmedRebound = type === "SUPPORT"
+          ? price >= zone.upper * (1 + STRUCTURE_REBOUND_CONFIRM_PCT)
+          : price <= zone.lower * (1 - STRUCTURE_REBOUND_CONFIRM_PCT);
+        const brokeZone = type === "SUPPORT"
+          ? price < zone.lower * (1 - STRUCTURE_REBOUND_CONFIRM_PCT)
+          : price > zone.upper * (1 + STRUCTURE_REBOUND_CONFIRM_PCT);
+
+        if (confirmedRebound) {
+          rebounds++;
+          lastReboundAt = trade.time;
+          inside = false;
+        } else if (brokeZone) {
+          inside = false;
+        }
+      }
+
+      previousPrice = price;
+    }
+
+    return {
+      ...zone,
+      type,
+      observedTouches,
+      rebounds,
+      lastTouchAt,
+      lastReboundAt
+    };
+  });
+}
+
+function structure120m(referencePrice = null) {
+  const structure = structureForWindow(referencePrice, STRUCTURE_ANALYSIS_WINDOW_MS, "120M");
+  if (!structure.ready) {
+    return {
+      ...structure,
+      windowMinutes: 120,
+      high120m: structure.high ?? null,
+      low120m: structure.low ?? null,
+      rangePct120m: structure.rangePct ?? null,
+      supports: [],
+      resistances: []
+    };
+  }
+
+  const now = Date.now();
+  const trades = recentTrades
+    .filter((trade) => trade.time >= now - STRUCTURE_ANALYSIS_WINDOW_MS)
+    .filter((trade) => Number.isFinite(trade.price));
+  const supports = observeStructureZones(structure.supports, trades, "SUPPORT");
+  const resistances = observeStructureZones(structure.resistances, trades, "RESISTANCE");
+  const matchZone = (zones, candidate) => candidate
+    ? zones.find((zone) => Math.abs(zone.price - candidate.price) <= structure.clusterToleranceAbs) ?? null
+    : null;
+
+  return {
+    ...structure,
+    windowMinutes: 120,
+    high120m: structure.high,
+    low120m: structure.low,
+    rangePct120m: structure.rangePct,
+    supports,
+    resistances,
+    support: matchZone(supports, structure.support),
+    resistance: matchZone(resistances, structure.resistance)
+  };
+}
+
+function structureZoneSnapshot(zone) {
+  if (!zone) return null;
+  return {
+    type: zone.type ?? null,
+    price: num(zone.price, 6),
+    lower: num(zone.lower, 6),
+    upper: num(zone.upper, 6),
+    pivotTouches: zone.touches ?? 0,
+    observedTouches: zone.observedTouches ?? 0,
+    rebounds: zone.rebounds ?? 0,
+    lastTouchAt: zone.lastTouchAt ? iso(zone.lastTouchAt) : null,
+    lastReboundAt: zone.lastReboundAt ? iso(zone.lastReboundAt) : null
+  };
+}
+
+function structure120Snapshot(structure) {
+  return {
+    ready: structure.ready,
+    reason: structure.reason,
+    mode: structure.mode,
+    windowMinutes: 120,
+    bucketCount: structure.bucketCount ?? 0,
+    current: num(structure.current, 6),
+    low120m: num(structure.low120m, 6),
+    high120m: num(structure.high120m, 6),
+    rangePct120m: pct(structure.rangePct120m),
+    support: structureZoneSnapshot(structure.support),
+    resistance: structureZoneSnapshot(structure.resistance),
+    supports: (structure.supports ?? []).map(structureZoneSnapshot),
+    resistances: (structure.resistances ?? []).map(structureZoneSnapshot)
+  };
+}
+
+function supportCandidatesForEntry(referencePrice = null) {
+  const requestedPrice = Number(referencePrice);
+  const current = Number.isFinite(requestedPrice) && requestedPrice > 0
+    ? requestedPrice
+    : marketReferencePrice()?.price ?? null;
+
+  if (!Number.isFinite(current) || current <= 0) {
+    return { current: null, candidates: [] };
+  }
+
+  const candidates = [
+    { source: "SUPPORT_60M", priority: 0, structure: structure60m(current) },
+    { source: "SUPPORT_120M", priority: 1, structure: structure120m(current) }
+  ]
+    .map(({ source, priority, structure }) => {
+      const support = structure?.support;
+      const supportPrice = Number(support?.price);
+      const lower = Number(support?.lower ?? support?.price);
+      const upper = Number(support?.upper ?? support?.price);
+      if (!Number.isFinite(supportPrice) || supportPrice <= 0 || !Number.isFinite(lower) || lower > current) {
+        return null;
+      }
+
+      return {
+        source,
+        priority,
+        support,
+        lower,
+        upper: Number.isFinite(upper) ? upper : supportPrice,
+        inZone: current <= (Number.isFinite(upper) ? upper : supportPrice),
+        distancePct: current > (Number.isFinite(upper) ? upper : supportPrice)
+          ? current / (Number.isFinite(upper) ? upper : supportPrice) - 1
+          : 0
+      };
+    })
+    .filter(Boolean);
+
+  const dayLow = Number(ticker24h?.low);
+  if (Number.isFinite(dayLow) && dayLow > 0 && dayLow <= current) {
+    candidates.push({
+      source: "LOW_24H",
+      priority: 2,
+      support: { price: dayLow, lower: dayLow, upper: dayLow, touches: null, rebounds: null },
+      lower: dayLow,
+      upper: dayLow,
+      inZone: current === dayLow,
+      distancePct: current / dayLow - 1
+    });
+  }
+
+  candidates.sort((a, b) => {
+    if (a.inZone !== b.inZone) return a.inZone ? -1 : 1;
+    if (Math.abs(a.distancePct - b.distancePct) > 1e-9) return a.distancePct - b.distancePct;
+    const touchesA = Number(a.support?.touches) || 0;
+    const touchesB = Number(b.support?.touches) || 0;
+    if (touchesA !== touchesB) return touchesB - touchesA;
+    return a.priority - b.priority;
+  });
+
+  return { current, candidates };
+}
+
+function supportEntryContext(referencePrice = null, bidPrice = null) {
+  const context = supportCandidatesForEntry(referencePrice);
+  const candidate = context.candidates[0] ?? null;
+  const bid = Number(bidPrice);
+
+  if (!candidate) {
+    return {
+      ok: false,
+      reason: "NO_VALIDATED_SUPPORT",
+      current: context.current,
+      buyPrice: null,
+      source: null,
+      support: null,
+      lower: null,
+      upper: null,
+      distancePct: null,
+      supportDistancePct: null,
+      candidateCount: 0
+    };
+  }
+
+  const marketBid = Number.isFinite(bid) && bid > 0 ? bid : context.current;
+  const makerCeiling = roundDown(marketBid + TICK);
+  const supportCeiling = roundDown(candidate.upper);
+  const buyPrice = roundDown(Math.min(makerCeiling, supportCeiling));
+  const distancePct = context.current > 0 && buyPrice > 0
+    ? context.current / buyPrice - 1
+    : null;
+  const supportDistancePct = context.current > candidate.upper
+    ? context.current / candidate.upper - 1
+    : 0;
+
+  return {
+    ok: Number.isFinite(buyPrice) && buyPrice > 0 &&
+      Number.isFinite(distancePct) && distancePct <= SUPPORT_ENTRY_MAX_DISTANCE_PCT,
+    reason: Number.isFinite(distancePct) && distancePct <= SUPPORT_ENTRY_MAX_DISTANCE_PCT
+      ? null
+      : "SUPPORT_TOO_FAR_FROM_MARKET",
+    current: context.current,
+    buyPrice,
+    source: candidate.source,
+    support: candidate.support,
+    lower: candidate.lower,
+    upper: candidate.upper,
+    distancePct,
+    supportDistancePct,
+    candidateCount: context.candidates.length
   };
 }
 
@@ -1922,29 +2612,34 @@ function supportContext60m(referencePrice = null) {
 }
 
 function downsideSupportForEntry(entryPrice) {
-  const local = supportContext60m(entryPrice);
-  const localSupport = local.support?.price;
+  const candidates = supportCandidatesForEntry(entryPrice).candidates;
+  const candidate = candidates[0] ?? null;
   const dayLow = ticker24h?.low ?? null;
 
-  if (Number.isFinite(localSupport) && localSupport > 0 && localSupport <= entryPrice) {
+  if (candidate) {
     return {
-      price: localSupport,
-      source: "SUPPORT_60M",
-      touches: local.support?.touches ?? null,
-      dayLow24h: dayLow
-    };
-  }
-
-  if (Number.isFinite(dayLow) && dayLow > 0 && dayLow <= entryPrice) {
-    return {
-      price: dayLow,
-      source: "LOW_24H",
-      touches: null,
+      price: candidate.support?.price ?? null,
+      source: candidate.source,
+      touches: candidate.support?.touches ?? null,
       dayLow24h: dayLow
     };
   }
 
   return { price: null, source: null, touches: null, dayLow24h: dayLow };
+}
+
+function supportProximityContext(entryPrice) {
+  const price = Number(entryPrice);
+  const support = downsideSupportForEntry(price).price;
+  const distancePct = Number.isFinite(price) && price > 0 && Number.isFinite(support) && support > 0
+    ? price / support - 1
+    : null;
+
+  return {
+    price: Number.isFinite(support) ? support : null,
+    distancePct,
+    near: distancePct !== null && distancePct >= 0 && distancePct <= SUPPORT_CAUTION_DISTANCE_PCT
+  };
 }
 
 function assessStructureForEntry(buyPrice, target) {
@@ -2053,31 +2748,22 @@ function assessStructureForEntry(buyPrice, target) {
 
 function activeScalpEquity() {
   let equity = Number(state.cash) || 0;
+  const bid = bestBid();
 
-  if (state.position && state.mode === "SELL_LIMIT") {
-    const simulated = simulateMarketSell(state.pearl);
-    if (simulated) {
-      equity += simulated.netUSDT;
-    } else {
-      const bid = bestBid();
-      equity += bid
-        ? state.pearl * bid * (1 - SELL_FEE)
-        : state.position.investedUSDT;
-    }
+  for (const position of openScalpPositions()) {
+    const simulated = simulateMarketSell(position.pearlReceived, buyFeeUSDT(position));
+    if (simulated) equity += simulated.netUSDT;
+    else equity += bid
+      ? netSellProceeds(position, position.pearlReceived * bid)
+      : position.investedUSDT;
   }
 
   return equity;
 }
 
-function protectedCapitalFloor() {
-  // El principal protegido corresponde SOLO al scalp activo.
-  // Si estamos comprados, no permitimos un stop defensivo por debajo del
-  // capital que esa posición realmente invirtió.
-  if (state.position && Number.isFinite(state.position.investedUSDT)) {
-    return state.position.investedUSDT;
-  }
-
-  return Math.max(0, Number(state.cash) || 0);
+function protectedCapitalFloor(position = null) {
+  if (position && Number.isFinite(position.investedUSDT)) return position.investedUSDT;
+  return scalpCostBasis();
 }
 
 function riskableProfitBuffer() {
@@ -2204,13 +2890,16 @@ function breakdownEntryGate(metric, supportContext) {
 // INITIAL BUY PRICE
 // ============================================================
 
-function proposedBuyPrice() {
+function proposedBuyPrice(referencePrice = null) {
   const bid = bestBid();
   const ask = bestAsk();
 
   if (!bid || !ask) return null;
 
-  let candidate = roundDown(bid + TICK);
+  const supportEntry = supportEntryContext(referencePrice, bid);
+  if (!supportEntry.ok) return null;
+
+  let candidate = supportEntry.buyPrice;
 
   // No cruzamos el ask con la orden inicial.
   if (candidate >= ask) {
@@ -2233,34 +2922,39 @@ function failedConditionNames(conditions) {
 // Señal DURA heredada: sirve para diagnóstico / confirmación posterior.
 // V5.1 ya NO espera a que esta señal sea completa para armar la LIMIT.
 function buildHardSignal(ignoreMode = false) {
-  if (!ignoreMode && state.mode !== "WAITING") return null;
+  if (!ignoreMode && state.buyOrder) return null;
 
   const cooldownOK = Date.now() - state.lastExitTimeMs >= COOLDOWN_MS;
   const metric = earlyArmMetric();
   if (!metric) return null;
 
   const flow = flowMetrics();
-  const buyPrice = proposedBuyPrice();
+  const buyPrice = proposedBuyPrice(metric.current);
   if (!buyPrice) return null;
 
-  const target = roundUp(buyPrice * (1 + TARGET_GROSS));
+  const target = targetPriceForEntry(buyPrice);
   const supportContext = supportContext60m(metric.current);
-  const breakdownGate = breakdownEntryGate(metric, supportContext);
-  const fallingGate = fallingMarketEntryGate();
+  const fallingGate = fallingMarketEntryGate(metric.current);
   const startupGate = startupContextStatus(metric.current);
   const entryZone = entryZoneContext(buyPrice, metric);
+  const breakdownGate = breakdownEntryGate(
+    metric,
+    entryZone.supportEntry?.support ? { support: entryZone.supportEntry.support } : supportContext
+  );
 
   const conditions = {
     scalpCapitalOK: state.cash >= MIN_SCALP_CASH_USDT,
     startupContextOK: startupGate.ready,
-    fallingMarketLockOK: fallingGate.ok,
+    fallingMarketLockOK: !fallingGate.lockId,
+    entryStabilityOK: fallingGate.entryStability?.ok ?? true,
     breakdownLockOK: breakdownGate.ok,
-    priceLadderOK: entryZone.ladder.ok,
-    rangePosition24hOK: entryZone.range.ok,
+    priceLadderOK: entryZone.ladder.ok || entryZone.supportEntryOK,
+    rangePosition24hOK: entryZone.range.ok || entryZone.supportEntryOK,
+    supportEntryOK: entryZone.supportEntryOK,
+    positionSpacingOK: positionSpacingContext(buyPrice).ok,
     cooldownOK,
     drawdownOK: metric.drawdown >= MIN_DRAWDOWN,
     lowZoneOK: metric.rangePosition <= MAX_RANGE_POSITION,
-    rangeOK: metric.rangePct >= MIN_RECENT_RANGE,
     freshLowOK: metric.lowAgeMs <= MAX_LOW_AGE_MS,
     sellPressureOK:
       flow.askShare === null ||
@@ -2279,6 +2973,7 @@ function buildHardSignal(ignoreMode = false) {
     fallingGate,
     startupGate,
     entryZone,
+    supportEntry: entryZone.supportEntry,
     ticker24h,
     targetSeenRecentlyAdvisory: Number.isFinite(metric.high)
       ? target <= metric.high
@@ -2290,48 +2985,54 @@ function buildHardSignal(ignoreMode = false) {
   };
 }
 
-// Señal TEMPRANA V5.1.8: si el bot YA tiene una zona maker válida,
-// la LIMIT se arma inmediatamente. NO esperamos ASK5m, drawdown 0.35%,
-// rango 0.45% ni otras confirmaciones lentas para colocar la orden.
+// Señal TEMPRANA V5.1.8.3: si el bot YA tiene una zona maker válida,
+// la LIMIT se arma inmediatamente. NO esperamos ASK5m, drawdown ni otras
+// confirmaciones lentas para colocar la orden.
 //
 // FLOW 5m sigue calculándose y se muestra como CONTEXTO.
 // El hardSignal sigue existiendo como confirmación posterior.
 // La BUY puede llenarse antes de que llegue ese hardSignal.
 function buildEarlyArmSignal(ignoreMode = false) {
-  if (!ignoreMode && state.mode !== "WAITING") return null;
+  if (!ignoreMode && state.buyOrder) return null;
 
   const cooldownOK = Date.now() - state.lastExitTimeMs >= COOLDOWN_MS;
   const metric = earlyArmMetric();
   if (!metric) return null;
 
   const flow = flowMetrics();
-  const buyPrice = proposedBuyPrice();
+  const buyPrice = proposedBuyPrice(metric.current);
   if (!buyPrice) return null;
 
-  const target = roundUp(buyPrice * (1 + TARGET_GROSS));
+  const target = targetPriceForEntry(buyPrice);
   const supportContext = supportContext60m(metric.current);
   const distanceToBuy = buyPrice > 0
     ? metric.current / buyPrice - 1
     : null;
-  const breakdownGate = breakdownEntryGate(metric, supportContext);
-  const fallingGate = fallingMarketEntryGate();
+  const fallingGate = fallingMarketEntryGate(metric.current);
   const startupGate = startupContextStatus(metric.current);
   const entryZone = entryZoneContext(buyPrice, metric);
+  const breakdownGate = breakdownEntryGate(
+    metric,
+    entryZone.supportEntry?.support ? { support: entryZone.supportEntry.support } : supportContext
+  );
 
   const conditions = {
     scalpCapitalOK: state.cash >= MIN_SCALP_CASH_USDT,
     startupContextOK: startupGate.ready,
-    fallingMarketLockOK: fallingGate.ok,
+    fallingMarketLockOK: !fallingGate.lockId,
+    entryStabilityOK: !fallingGate.lockId,
     breakdownLockOK: breakdownGate.ok,
-    priceLadderOK: entryZone.ladder.ok,
-    rangePosition24hOK: entryZone.range.ok,
+    priceLadderOK: entryZone.ladder.ok || entryZone.supportEntryOK,
+    rangePosition24hOK: entryZone.range.ok || entryZone.supportEntryOK,
+    supportEntryOK: entryZone.supportEntryOK,
+    positionSpacingOK: positionSpacingContext(buyPrice).ok,
     cooldownOK,
     buyBelowMarketOK:
       distanceToBuy !== null &&
       distanceToBuy >= EARLY_ARM_MIN_DISTANCE,
     buyNotTooFarOK:
       distanceToBuy !== null &&
-      distanceToBuy <= EARLY_ARM_MAX_DISTANCE
+      distanceToBuy <= SUPPORT_ENTRY_MAX_DISTANCE_PCT
   };
 
   return {
@@ -2346,6 +3047,7 @@ function buildEarlyArmSignal(ignoreMode = false) {
     fallingGate,
     startupGate,
     entryZone,
+    supportEntry: entryZone.supportEntry,
     ticker24h,
     distanceToBuy,
     targetSeenRecentlyAdvisory: Number.isFinite(metric.high)
@@ -2363,13 +3065,33 @@ function buildEarlyArmSignal(ignoreMode = false) {
 // ============================================================
 
 function placeBuyLimit(signal, placementContext = null) {
+  if (!state.tradingEnabled) return false;
+  if (state.buyOrder) return false; // una sola BUY pendiente a la vez
+
   const now = Date.now();
   const price = signal.buyPrice;
   const allocation = scalpAllocation(signal);
   const capitalToUse = allocation.capital;
+  const spacing = positionSpacingContext(price);
+
+  if (!spacing.ok) {
+    state.positionSpacingBlocks = (state.positionSpacingBlocks || 0) + 1;
+    logEvent("↔️ BUY BLOCKED BY POSITION SPACING", {
+      requestedPrice: price,
+      target: signal.target,
+      minimumSpacing: pct(MIN_POSITION_SPACING_PCT),
+      nearestEntry: spacing.nearestEntry,
+      nearestDistance: pct(spacing.nearestDistancePct),
+      nearestPositionId: spacing.nearestPositionId,
+      nearestType: spacing.nearestType,
+      action: "WAIT_FOR_DISTINCT_SCALP_LEVEL"
+    });
+    saveState();
+    return false;
+  }
 
   if (!allocation.zone.ok) {
-    logEvent("🚫 BUY BLOCKED BY V5.1.8 ENTRY ZONE", {
+    logEvent("🚫 BUY BLOCKED BY V5.1.8.3 ENTRY ZONE", {
       requestedPrice: price,
       target: signal.target,
       rangeMode: allocation.zone.range.mode,
@@ -2383,9 +3105,7 @@ function placeBuyLimit(signal, placementContext = null) {
     return false;
   }
 
-  if (!Number.isFinite(capitalToUse) || capitalToUse < MIN_SCALP_CASH_USDT) {
-    return false;
-  }
+  if (!Number.isFinite(capitalToUse) || capitalToUse < MIN_SCALP_CASH_USDT) return false;
 
   const requestedPearl = capitalToUse / price;
   const queueAhead = bookAmountAt(bids, price);
@@ -2394,35 +3114,38 @@ function placeBuyLimit(signal, placementContext = null) {
     firstPlacedAt: iso(now),
     firstPlacedAtMs: now,
     ...placementCausalityFields(placementContext),
-
     entrySignalType: signal.type || "UNKNOWN",
     hardSignalConfirmedAt: signal.type === "HARD_SIGNAL" ? iso(now) : null,
     hardSignalConfirmedAtMs: signal.type === "HARD_SIGNAL" ? now : null,
-
     price,
     target: signal.target,
-
     cash: capitalToUse,
     allocationMode: allocation.mode,
     allocationFraction: allocation.fraction,
+    multiPositionSlotCap: allocation.slotCap,
     reserveAfterFill: allocation.reserveAfterFill,
     highRangeCaution: allocation.caution,
+    supportCaution: allocation.supportCaution,
+    supportEntry: allocation.zone.supportEntry,
     entryZone: allocation.zone,
+    spacingAtPlacement: spacing,
     requestedPearl,
-
     queueAhead,
     qualifyingVolume: 0,
     requiredFlow: (queueAhead + requestedPearl) * FILL_SAFETY
   };
 
-  state.mode = "BUY_LIMIT";
+  syncLegacyScalpView();
   state.buyOrdersPlaced++;
-
-  if (signal.type === "EARLY_ARM") {
-    state.earlyBuyOrdersArmed = (state.earlyBuyOrdersArmed || 0) + 1;
-  }
-  if (["HIGH_RANGE_CAUTION", "EXHAUSTION_CAUTION", "UPPER_RANGE_CAUTION"].includes(allocation.mode)) {
+  if (signal.type === "EARLY_ARM") state.earlyBuyOrdersArmed = (state.earlyBuyOrdersArmed || 0) + 1;
+  if (["HIGH_RANGE_CAUTION", "EXHAUSTION_CONTEXT", "UPPER_RANGE_CAUTION"].includes(allocation.mode)) {
     state.highRangeCautionOrders = (state.highRangeCautionOrders || 0) + 1;
+  }
+  if (allocation.mode === "SUPPORT_CAUTION") {
+    state.supportCautionOrders = (state.supportCautionOrders || 0) + 1;
+  }
+  if (allocation.mode === "SOFT_FALLING_CONTEXT") {
+    state.softFallingCautionOrders = (state.softFallingCautionOrders || 0) + 1;
   }
 
   append(SIGNALS_FILE, {
@@ -2434,15 +3157,19 @@ function placeBuyLimit(signal, placementContext = null) {
   });
 
   console.log(signal.type === "EARLY_ARM" ? "\n🟡 EARLY BUY ARMED" : "\n🟡 BUY LIMIT", {
-    entrySignalType: signal.type,
-    price,
-    target: signal.target,
-    allocationMode: allocation.mode,
-    capitalToUse: num(capitalToUse),
+    entrySignalType: signal.type, price, target: signal.target,
+    allocationMode: allocation.mode, capitalToUse: num(capitalToUse),
+    multiPositionSlotCap: num(allocation.slotCap),
+    openScalpPositions: openScalpPositions().length,
+    minimumPositionSpacing: pct(MIN_POSITION_SPACING_PCT),
     capitalFraction: pct(allocation.fraction),
     cashReserveIfFilled: num(allocation.reserveAfterFill),
     highRangeExhaustionVotes: allocation.caution.exhaustionVotes,
     highRangeCautionActive: allocation.caution.active,
+    fallingRegime: allocation.falling?.regime ?? "NORMAL_SCALP",
+    softFallingCautionActive: allocation.falling?.softCaution ?? false,
+    supportCaution: allocation.supportCaution,
+    supportEntry: allocation.zone.supportEntry,
     rangeAllocationMode: allocation.zone.range.mode,
     rangePosition24hAtBuy: pct(allocation.zone.range.rangePosition24h),
     priceLadderOK: allocation.zone.ladder.ok,
@@ -2452,22 +3179,20 @@ function placeBuyLimit(signal, placementContext = null) {
     startupContextReady: signal.startupGate?.ready ?? null,
     startupElapsedSeconds: num(signal.startupGate?.elapsedSeconds, 1),
     startupLiveTrades: signal.startupGate?.liveTrades ?? null,
-    lastPrice: signal.metric.current,
-    recentLow: signal.metric.low,
+    lastPrice: signal.metric.current, recentLow: signal.metric.low,
     support60m: num(signal.supportContext.support?.price, 4),
     supportTouches60m: signal.supportContext.support?.touches ?? null,
-    low24h: num(signal.ticker24h?.low, 4),
-    high24h: num(signal.ticker24h?.high, 4),
+    supportEntrySource: signal.supportEntry?.source ?? null,
+    supportEntryPrice: num(signal.supportEntry?.buyPrice, 4),
+    supportEntryDistance: pct(signal.supportEntry?.distancePct),
+    low24h: num(signal.ticker24h?.low, 4), high24h: num(signal.ticker24h?.high, 4),
     rangePosition24h: pct(tickerRangePosition24h(signal.metric.current)),
     targetSeenRecentlyAdvisory: signal.targetSeenRecentlyAdvisory,
     distanceToBuy: pct(signal.distanceToBuy),
     marketReferenceSource: signal.marketReferenceSource ?? null,
     marketSampleCount: signal.marketSampleCount ?? null,
-    failedHardConditionsAtArm: signal.type === "EARLY_ARM"
-      ? (buildHardSignal(true)?.failedConditions ?? null)
-      : [],
-    askShare5m: pct(signal.flow.askShare),
-    bidShare5m: pct(signal.flow.bidShare)
+    failedHardConditionsAtArm: signal.type === "EARLY_ARM" ? (buildHardSignal(true)?.failedConditions ?? null) : [],
+    askShare5m: pct(signal.flow.askShare), bidShare5m: pct(signal.flow.bidShare)
   });
 
   saveState();
@@ -2493,18 +3218,36 @@ function cancelBuy(reason) {
   }
 
   state.buyOrder = null;
-  state.mode = "WAITING";
+  syncLegacyScalpView();
 
   saveState();
 }
 
 // ============================================================
-// V5.1.8 — STATIC EARLY-ARM BUY / NO REPRICE UP
+// V5.2.0 — SUPPORT-ANCHORED EARLY-ARM BUY
 // ============================================================
 
-// La entrada anticipada se mantiene estática durante 90 s.
-// Si no llena, TTL_EXPIRED cancela el intento y la siguiente
-// señal se calcula desde cero con el mercado actual.
+// La BUY nunca persigue al precio hacia arriba. Si el soporte válido baja,
+// se cancela la orden vieja antes del cross-through y se rearma más abajo.
+
+function pendingSupportRearmContext(order, currentPrice) {
+  const ageMs = Date.now() - Number(order?.firstPlacedAtMs || 0);
+  if (!Number.isFinite(ageMs) || ageMs < SUPPORT_REARM_MIN_AGE_MS) {
+    return { rearm: false, reason: "SUPPORT_REARM_GRACE", next: null };
+  }
+
+  const next = supportEntryContext(currentPrice, currentPrice);
+  if (!next.ok) {
+    return { rearm: true, reason: next.reason || "SUPPORT_UNAVAILABLE", next };
+  }
+
+  const minMove = Math.max(TICK, Number(order.price) * SUPPORT_REARM_MIN_MOVE_PCT);
+  return {
+    rearm: next.buyPrice <= Number(order.price) - minMove,
+    reason: "SUPPORT_MOVED_DOWN",
+    next
+  };
+}
 
 // ============================================================
 // BUY FILLED
@@ -2513,6 +3256,19 @@ function cancelBuy(reason) {
 function fillBuy(fillMeta = {}) {
   const order = state.buyOrder;
   if (!order) return;
+
+  const spacing = positionSpacingContext(order.price);
+  if (!spacing.ok) {
+    state.positionSpacingBlocks = (state.positionSpacingBlocks || 0) + 1;
+    logEvent("↔️ BUY FILL ABORTED BY POSITION SPACING", {
+      orderPrice: order.price,
+      nearestEntry: spacing.nearestEntry,
+      nearestDistance: pct(spacing.nearestDistancePct),
+      nearestPositionId: spacing.nearestPositionId
+    });
+    cancelBuy("POSITION_SPACING_RELOCKED");
+    return;
+  }
 
   const capital = order.cash;
   if (!Number.isFinite(capital) || capital <= 0 || state.cash + 1e-9 < capital) {
@@ -2526,14 +3282,37 @@ function fillBuy(fillMeta = {}) {
   }
 
   const grossPearl = capital / order.price;
-  const buyFeePearl = grossPearl * BUY_FEE;
-  const pearlReceived = grossPearl - buyFeePearl;
-
-  const sellTarget = roundUp(order.price * (1 + TARGET_GROSS));
+  const buyFee = capital * BUY_FEE;
+  const pearlReceived = grossPearl;
+  const sellTarget = targetPriceForEntry(order.price);
   const downsideSupport = downsideSupportForEntry(order.price);
   const entryNow = Date.now();
 
-  state.position = {
+  state.scalpPositionsOpened = (state.scalpPositionsOpened || 0) + 1;
+  const positionId = `scalp-${entryNow}-${state.scalpPositionsOpened}`;
+
+  const queueAhead = bookAmountAt(asks, sellTarget);
+  const sellPlacedAtMs = Date.now();
+  const sellPlacementContext = {
+    batchId: fillMeta.tradeObservationBatchId ?? null,
+    tradeTimeMs: fillMeta.tradeExchangeTimeMs ?? null,
+    source: fillMeta.tradeSource ?? null
+  };
+
+  const sellOrder = {
+    positionId,
+    placedAt: iso(sellPlacedAtMs),
+    placedAtMs: sellPlacedAtMs,
+    ...placementCausalityFields(sellPlacementContext),
+    price: sellTarget,
+    pearl: pearlReceived,
+    queueAhead,
+    qualifyingVolume: 0,
+    requiredFlow: (queueAhead + pearlReceived) * FILL_SAFETY
+  };
+
+  const position = {
+    id: positionId,
     entryTime: iso(entryNow),
     entryTimeMs: entryNow,
     entryPrice: order.price,
@@ -2541,13 +3320,15 @@ function fillBuy(fillMeta = {}) {
     hardSignalConfirmedAt: order.hardSignalConfirmedAt || null,
     allocationMode: order.allocationMode || "NORMAL_SCALP",
     allocationFraction: order.allocationFraction ?? 1,
+    supportCautionAtEntry: order.supportCaution ?? null,
     reserveAtEntry: Number.isFinite(order.reserveAfterFill) ? order.reserveAfterFill : 0,
     highRangeCautionAtEntry: order.highRangeCaution ?? null,
     investedUSDT: capital,
     grossPearl,
-    buyFeePearl,
+    buyFeeUSDT: buyFee,
     pearlReceived,
     sellTarget,
+    sellOrder,
     structuralSupportAtEntry: downsideSupport.price,
     structuralSupportSource: downsideSupport.source,
     structuralSupportTouches: downsideSupport.touches,
@@ -2563,88 +3344,44 @@ function fillBuy(fillMeta = {}) {
   };
 
   state.cash = Math.max(0, state.cash - capital);
-  state.pearl = pearlReceived;
+  state.scalpPositions.push(position);
   state.buyOrdersFilled++;
   state.buyOrder = null;
-
-  const queueAhead = bookAmountAt(asks, sellTarget);
-  const sellPlacedAtMs = Date.now();
-  const sellPlacementContext = {
-    batchId: fillMeta.tradeObservationBatchId ?? null,
-    tradeTimeMs: fillMeta.tradeExchangeTimeMs ?? null,
-    source: fillMeta.tradeSource ?? null
-  };
-
-  state.sellOrder = {
-    placedAt: iso(sellPlacedAtMs),
-    placedAtMs: sellPlacedAtMs,
-    ...placementCausalityFields(sellPlacementContext),
-    price: sellTarget,
-    pearl: pearlReceived,
-    queueAhead,
-    qualifyingVolume: 0,
-    requiredFlow: (queueAhead + pearlReceived) * FILL_SAFETY
-  };
-
-  state.mode = "SELL_LIMIT";
   state.sellOrdersPlaced = (state.sellOrdersPlaced || 0) + 1;
+  syncLegacyScalpView();
 
   append(TRADES_FILE, {
-    type: "PAPER_BUY_FILLED",
-    time: iso(),
-    localTime: localClock().text,
-    entryPrice: order.price,
-    investedUSDT: capital,
-    allocationMode: order.allocationMode || "NORMAL_SCALP",
-    allocationFraction: order.allocationFraction ?? 1,
+    type: "PAPER_BUY_FILLED", time: iso(), localTime: localClock().text, positionId,
+    entryPrice: order.price, investedUSDT: capital, allocationMode: order.allocationMode || "NORMAL_SCALP",
+    allocationFraction: order.allocationFraction ?? 1, supportCaution: order.supportCaution ?? null,
     cashReserveAfterFill: num(state.cash),
-    grossPearl: num(grossPearl),
-    buyFeePearl: num(buyFeePearl),
-    pearlReceived: num(pearlReceived),
-    sellTarget,
-    structuralSupportAtEntry: downsideSupport.price,
-    structuralSupportSource: downsideSupport.source,
-    low24hAtEntry: ticker24h?.low ?? null,
-    high24hAtEntry: ticker24h?.high ?? null,
-    fillMethod: fillMeta.method || null,
-    fillTriggerTradePrice: fillMeta.tradePrice ?? null,
-    fillTriggerTradeSide: fillMeta.tradeSide ?? null,
-    fillTriggerTradeSource: fillMeta.tradeSource ?? null,
-    fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null,
-    fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null,
-    fillCausalAgeMs: fillMeta.causalAgeMs ?? null,
-    sellOrderPlacedAt: state.sellOrder.placedAt
+    grossPearl: num(grossPearl), buyFeeUSDT: num(buyFee), pearlReceived: num(pearlReceived),
+    sellTarget, structuralSupportAtEntry: downsideSupport.price, structuralSupportSource: downsideSupport.source,
+    low24hAtEntry: ticker24h?.low ?? null, high24hAtEntry: ticker24h?.high ?? null,
+    fillMethod: fillMeta.method || null, fillTriggerTradePrice: fillMeta.tradePrice ?? null,
+    fillTriggerTradeSide: fillMeta.tradeSide ?? null, fillTriggerTradeSource: fillMeta.tradeSource ?? null,
+    fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null, fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null,
+    fillCausalAgeMs: fillMeta.causalAgeMs ?? null, sellOrderPlacedAt: sellOrder.placedAt
   });
 
   console.log("\n🟢 BUY FILLED", {
-    entry: order.price,
-    entrySignalType: order.entrySignalType || null,
-    hardSignalConfirmedBeforeFill: Boolean(order.hardSignalConfirmedAt),
-    target045: sellTarget,
-    pearlReceived: num(pearlReceived),
-    supportAtEntry: num(downsideSupport.price, 4),
-    supportSource: downsideSupport.source,
-    low24hAtEntry: num(ticker24h?.low, 4),
-    high24hAtEntry: num(ticker24h?.high, 4),
-    capital,
-    fillMethod: fillMeta.method || null,
-    fillTriggerTradePrice: fillMeta.tradePrice ?? null,
-    fillTriggerTradeSide: fillMeta.tradeSide ?? null,
-    fillTriggerTradeSource: fillMeta.tradeSource ?? null,
-    fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null,
-    fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null,
-    fillCausalAgeMs: fillMeta.causalAgeMs ?? null
+    positionId, entry: order.price, entrySignalType: order.entrySignalType || null,
+    hardSignalConfirmedBeforeFill: Boolean(order.hardSignalConfirmedAt), targetPlusOneCent: sellTarget,
+    pearlReceived: num(pearlReceived), supportAtEntry: num(downsideSupport.price, 4),
+    supportSource: downsideSupport.source, low24hAtEntry: num(ticker24h?.low, 4),
+    high24hAtEntry: num(ticker24h?.high, 4), capital, cashRemaining: num(state.cash),
+    openScalpPositions: openScalpPositions().length, fillMethod: fillMeta.method || null,
+    fillTriggerTradePrice: fillMeta.tradePrice ?? null, fillTriggerTradeSide: fillMeta.tradeSide ?? null,
+    fillTriggerTradeSource: fillMeta.tradeSource ?? null, fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null,
+    fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null, fillCausalAgeMs: fillMeta.causalAgeMs ?? null
   });
 
   logEvent("🟠 SELL LIMIT PLACED", {
-    orderPrice: state.sellOrder.price,
-    pearl: num(state.sellOrder.pearl),
-    queueAhead: num(state.sellOrder.queueAhead),
-    requiredFlow: num(state.sellOrder.requiredFlow),
-    placedAt: state.sellOrder.placedAt,
-    placedInObservationBatchId: state.sellOrder.placedInObservationBatchId,
-    placedAfterTradeExchangeTime: state.sellOrder.placedAfterTradeExchangeTime,
-    placementObservationSource: state.sellOrder.placementObservationSource,
+    positionId, orderPrice: sellOrder.price, pearl: num(sellOrder.pearl),
+    queueAhead: num(sellOrder.queueAhead), requiredFlow: num(sellOrder.requiredFlow),
+    placedAt: sellOrder.placedAt, placedInObservationBatchId: sellOrder.placedInObservationBatchId,
+    placedAfterTradeExchangeTime: sellOrder.placedAfterTradeExchangeTime,
+    placementObservationSource: sellOrder.placementObservationSource,
     rule: "ONLY_TRADES_OBSERVED_AFTER_THIS_ORDER_MAY_FILL"
   });
 
@@ -2656,11 +3393,11 @@ function fillBuy(fillMeta = {}) {
 // ============================================================
 
 function recoveryPositionNetValue(recovery) {
-  const simulated = simulateMarketSell(recovery.pearlReceived);
+  const simulated = simulateMarketSell(recovery.pearlReceived, buyFeeUSDT(recovery));
   if (simulated) return simulated.netUSDT;
 
   const bid = bestBid();
-  if (bid) return recovery.pearlReceived * bid * (1 - SELL_FEE);
+  if (bid) return netSellProceeds(recovery, recovery.pearlReceived * bid);
 
   return recovery.investedUSDT;
 }
@@ -2680,92 +3417,59 @@ function currentEquity() {
 // CLOSE POSITION
 // ============================================================
 
-function finalizeSell({ reason, sellPrice, finalUSDT, market, fillMeta = {} }) {
-  const position = state.position;
-  if (!position) return;
+function finalizeSell(positionId, { reason, sellPrice, finalUSDT, market, fillMeta = {} }) {
+  const index = openScalpPositions().findIndex((p) => p.id === positionId);
+  if (index < 0) return false;
 
+  const position = state.scalpPositions[index];
+  const sellOrder = position.sellOrder || null;
   const capitalBefore = position.investedUSDT;
   const profit = finalUSDT - capitalBefore;
   const roi = profit / capitalBefore;
   const holdSeconds = (Date.now() - position.entryTimeMs) / 1000;
 
   state.cash += finalUSDT;
-  state.pearl = 0;
-
+  state.scalpPositions.splice(index, 1);
   state.cycles++;
   state.sellOrdersFilled++;
-
   state.realizedProfit = (Number(state.realizedProfit) || 0) + profit;
-  state.peakRealizedProfit = Math.max(
-    Number(state.peakRealizedProfit) || 0,
-    state.realizedProfit
-  );
+  state.peakRealizedProfit = Math.max(Number(state.peakRealizedProfit) || 0, state.realizedProfit);
   state.lastExitTimeMs = Date.now();
 
-  if (reason === "TARGET_0.45") state.targetExits++;
+  if (reason === "TARGET_PLUS_0.0100") state.targetExits++;
   if (reason === "CAPITAL_PROTECTED_STOP") {
     state.stopExits++;
     state.capitalProtectedStops++;
   }
 
-
   const row = {
-    type: "PAPER_SELL_FILLED",
-    reason,
-    market,
-
-    time: iso(),
-    localTime: localClock().text,
-
-    cycle: state.cycles,
-
-    entryPrice: position.entryPrice,
-    sellPrice: num(sellPrice, 6),
-
-    grossMove: pct(sellPrice / position.entryPrice - 1),
-    cycleROI: pct(roi),
-
-    holdSeconds: num(holdSeconds, 2),
-
-    capitalBefore: num(capitalBefore),
-    capitalAfter: num(finalUSDT),
-    cycleProfit: num(profit),
-    totalProfit: num(state.realizedProfit),
-    fillMethod: fillMeta.method || null,
-    fillTriggerTradePrice: fillMeta.tradePrice ?? null,
-    fillTriggerTradeSide: fillMeta.tradeSide ?? null,
-    fillTriggerTradeSource: fillMeta.tradeSource ?? null,
-    fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null,
-    fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null,
-    causalAgeMs: fillMeta.causalAgeMs ?? null,
-    exchangeAgeVsOrderMs: fillMeta.exchangeAgeVsOrderMs ?? null,
-    sellOrderPlacedAt: state.sellOrder?.placedAt ?? null
+    type: "PAPER_SELL_FILLED", reason, market, time: iso(), localTime: localClock().text,
+    cycle: state.cycles, positionId, entryPrice: position.entryPrice, sellPrice: num(sellPrice, 6),
+    grossMove: pct(sellPrice / position.entryPrice - 1), cycleROI: pct(roi), holdSeconds: num(holdSeconds, 2),
+    capitalBefore: num(capitalBefore), capitalAfter: num(finalUSDT), cycleProfit: num(profit),
+    totalProfit: num(state.realizedProfit), fillMethod: fillMeta.method || null,
+    fillTriggerTradePrice: fillMeta.tradePrice ?? null, fillTriggerTradeSide: fillMeta.tradeSide ?? null,
+    fillTriggerTradeSource: fillMeta.tradeSource ?? null, fillTriggerTradeExchangeTime: fillMeta.tradeExchangeTime ?? null,
+    fillTriggerTradeObservedAt: fillMeta.tradeObservedAt ?? null, causalAgeMs: fillMeta.causalAgeMs ?? null,
+    exchangeAgeVsOrderMs: fillMeta.exchangeAgeVsOrderMs ?? null, sellOrderPlacedAt: sellOrder?.placedAt ?? null
   };
 
   append(TRADES_FILE, row);
-
   console.log("\n💰 POSITION CLOSED", row);
-
-  state.position = null;
-  state.sellOrder = null;
-  state.mode = "WAITING";
-
+  syncLegacyScalpView();
   saveState();
+  return true;
 }
 
-// ============================================================
-// NORMAL TARGET +0.45%
-// ============================================================
+function normalTargetSell(positionId, fillMeta = {}) {
+  const position = openScalpPositions().find((p) => p.id === positionId);
+  const sell = position?.sellOrder;
+  if (!position || !sell) return false;
 
-function normalTargetSell(fillMeta = {}) {
-  const sell = state.sellOrder;
-  if (!sell) return;
-
-  const grossUSDT = state.pearl * sell.price;
-  const finalUSDT = grossUSDT * (1 - SELL_FEE);
-
-  finalizeSell({
-    reason: "TARGET_0.45",
+  const grossUSDT = position.pearlReceived * sell.price;
+  const finalUSDT = netSellProceeds(position, grossUSDT);
+  return finalizeSell(positionId, {
+    reason: "TARGET_PLUS_0.0100",
     sellPrice: sell.price,
     finalUSDT,
     market: false,
@@ -2774,78 +3478,59 @@ function normalTargetSell(fillMeta = {}) {
 }
 
 // ============================================================
-// PROTECTED MARKET EXIT — V4.8
+// PROTECTED MARKET EXIT — V4.8 (POR POSICIÓN)
 // ============================================================
 
 let lastCapitalFloorBlockLogMs = 0;
 
-function protectedMarketExit(reason) {
-  if (state.mode !== "SELL_LIMIT" || !state.position) {
-    return false;
-  }
+function protectedMarketExit(positionId, reason) {
+  const position = openScalpPositions().find((p) => p.id === positionId);
+  if (!position) return false;
 
-  const simulated = simulateMarketSell(state.pearl);
-
+  const simulated = simulateMarketSell(position.pearlReceived, buyFeeUSDT(position));
   if (!simulated) {
-    logEvent("⚠️ PROTECTED EXIT FAILED", {
-      reason,
-      detail: "INSUFFICIENT_VISIBLE_BID_DEPTH"
-    });
-
+    logEvent("⚠️ PROTECTED EXIT FAILED", { positionId, reason, detail: "INSUFFICIENT_VISIBLE_BID_DEPTH" });
     return false;
   }
 
-  const floor = protectedCapitalFloor();
+  const floor = protectedCapitalFloor(position);
   const wouldReceive = simulated.netUSDT;
-
-  // Regla central V4.8:
-  // una salida DEFENSIVA nunca puede realizar capital por debajo del piso.
   if (wouldReceive + 1e-9 < floor) {
     const now = Date.now();
-
-    // Evita imprimir cientos de veces por segundo la misma protección.
     if (now - lastCapitalFloorBlockLogMs >= 30000) {
       lastCapitalFloorBlockLogMs = now;
       state.capitalFloorBlockedStops++;
-
       logEvent("🛡️ STOP BLOCKED BY CAPITAL FLOOR", {
-        reason,
-        entryPrice: state.position.entryPrice,
-        estimatedSellPrice: num(simulated.avgPrice, 6),
-        estimatedNetUSDT: num(wouldReceive),
-        protectedCapitalFloor: num(floor),
-        amountBelowFloor: num(floor - wouldReceive),
+        positionId, reason, entryPrice: position.entryPrice,
+        estimatedSellPrice: num(simulated.avgPrice, 6), estimatedNetUSDT: num(wouldReceive),
+        protectedCapitalFloor: num(floor), amountBelowFloor: num(floor - wouldReceive),
         action: "HOLD_POSITION"
       });
-
       saveState();
     }
-
     return false;
   }
 
-  finalizeSell({
+  return finalizeSell(positionId, {
     reason: "CAPITAL_PROTECTED_STOP",
     sellPrice: simulated.avgPrice,
     finalUSDT: simulated.netUSDT,
     market: true
   });
-
-  return true;
 }
 
 function recoveryTargetPrice(position) {
-  const exactBreakEven =
-    position.investedUSDT /
-    (position.pearlReceived * (1 - SELL_FEE));
-
-  return roundUp(exactBreakEven * (1 + RECOVERY_EXIT_BUFFER_PCT));
+  const target = Number(position?.sellTarget);
+  return Number.isFinite(target) && target > 0
+    ? target
+    : targetPriceForEntry(position.entryPrice);
 }
 
-function moveActivePositionToRecovery(reason, placementContext = null) {
-  if (state.mode !== "SELL_LIMIT" || !state.position) return false;
+function moveActivePositionToRecovery(positionId, reason, placementContext = null) {
+  const positionIndex = openScalpPositions().findIndex((p) => p.id === positionId);
+  if (positionIndex < 0) return false;
 
-  const position = state.position;
+  const position = state.scalpPositions[positionIndex];
   const support = position.structuralSupportAtEntry;
   const breakPrice = Number.isFinite(support)
     ? support * (1 - STRUCTURAL_STOP_BREAK_PCT)
@@ -2853,7 +3538,7 @@ function moveActivePositionToRecovery(reason, placementContext = null) {
   const target = recoveryTargetPrice(position);
   const recoveryId = `recovery-${Date.now()}-${state.recoveryHoldsStarted + 1}`;
 
-  // V5.1.8 — ANCLA INMUTABLE DEL SOPORTE 24H.
+  // V5.1.8.3 — ANCLA INMUTABLE DEL SOPORTE 24H.
   // Preferimos el low24h vigente EXACTAMENTE cuando nace el recovery.
   // Si el ticker no está disponible, usamos el low24h capturado en la entrada.
   const currentLow24h = Number(ticker24h?.low);
@@ -2886,6 +3571,7 @@ function moveActivePositionToRecovery(reason, placementContext = null) {
     entryTimeMs: position.entryTimeMs,
     entryPrice: position.entryPrice,
     investedUSDT: position.investedUSDT,
+    buyFeeUSDT: buyFeeUSDT(position),
     pearlReceived: position.pearlReceived,
     recoveryTarget: target,
 
@@ -2926,11 +3612,9 @@ function moveActivePositionToRecovery(reason, placementContext = null) {
     recoveryId
   });
 
-  // Sacamos esta posición del motor de scalp SIN venderla.
-  state.position = null;
-  state.sellOrder = null;
-  state.pearl = 0;
-  state.mode = "WAITING";
+  // Sacamos SOLO esta posición del motor de scalp SIN venderla.
+  state.scalpPositions.splice(positionIndex, 1);
+  syncLegacyScalpView();
   state.lastExitTimeMs = Date.now();
 
   const fallingLock = activateFallingMarketLock({
@@ -2941,6 +3625,7 @@ function moveActivePositionToRecovery(reason, placementContext = null) {
 
   logEvent("🧊 POSITION MOVED TO RECOVERY_HOLD", {
     recoveryId,
+    sourcePositionId: positionId,
     reason,
     entryPrice: position.entryPrice,
     investedUSDT: num(position.investedUSDT),
@@ -2979,6 +3664,7 @@ function moveActivePositionToRecovery(reason, placementContext = null) {
     time: iso(),
     localTime: localClock().text,
     recoveryId,
+    sourcePositionId: positionId,
     reason,
     entryPrice: position.entryPrice,
     investedUSDT: num(position.investedUSDT),
@@ -3018,8 +3704,8 @@ function finalizeRecoveryPosition(recovery, {
     state.realizedProfit
   );
 
-  if (reason === "RECOVERY_BREAK_EVEN_EXIT") {
-    state.recoveryBreakEvenExits++;
+  if (reason === "RECOVERY_TARGET_PLUS_0.0100") {
+    state.targetExits++;
   } else if (
     reason === "RECOVERY_HARD_STOP_ANCHORED_SUPPORT_BREAK" ||
     reason === "RECOVERY_HARD_STOP_10PCT"
@@ -3089,8 +3775,10 @@ function processRecoveryTrade(trade, source, observationMeta = {}) {
     }
 
     if (relation > 0) {
-      const finalUSDT =
-        recovery.pearlReceived * recovery.recoveryTarget * (1 - SELL_FEE);
+      const finalUSDT = netSellProceeds(
+        recovery,
+        recovery.pearlReceived * recovery.recoveryTarget
+      );
 
       logEvent("⚡ RECOVERY CROSS-THROUGH FILL", {
         recoveryId: recovery.id,
@@ -3106,7 +3794,7 @@ function processRecoveryTrade(trade, source, observationMeta = {}) {
       });
 
       finalizeRecoveryPosition(recovery, {
-        reason: "RECOVERY_BREAK_EVEN_EXIT",
+        reason: "RECOVERY_TARGET_PLUS_0.0100",
         sellPrice: recovery.recoveryTarget,
         finalUSDT,
         market: false,
@@ -3130,11 +3818,13 @@ function processRecoveryTrade(trade, source, observationMeta = {}) {
       recovery.qualifyingVolume += trade.amount;
 
       if (recovery.qualifyingVolume >= recovery.requiredFlow) {
-        const finalUSDT =
-          recovery.pearlReceived * recovery.recoveryTarget * (1 - SELL_FEE);
+        const finalUSDT = netSellProceeds(
+          recovery,
+          recovery.pearlReceived * recovery.recoveryTarget
+        );
 
         finalizeRecoveryPosition(recovery, {
-          reason: "RECOVERY_BREAK_EVEN_EXIT",
+          reason: "RECOVERY_TARGET_PLUS_0.0100",
           sellPrice: recovery.recoveryTarget,
           finalUSDT,
           market: false,
@@ -3162,7 +3852,7 @@ function checkRecoveryHardStops() {
   const now = Date.now();
 
   for (const recovery of [...state.recoveryPositions]) {
-    const simulated = simulateMarketSell(recovery.pearlReceived);
+    const simulated = simulateMarketSell(recovery.pearlReceived, buyFeeUSDT(recovery));
     if (!simulated) continue;
 
     const dangerThreshold =
@@ -3172,8 +3862,43 @@ function checkRecoveryHardStops() {
 
     // --------------------------------------------------------
     // 1) -10% SOLO ARMA RECOVERY_DANGER. NO VENDE.
+    // V5.1.8.3.1: DANGER es una CONDICIÓN ACTUAL, no un latch histórico.
+    // Si el valor neto recupera por encima de -10%, se limpia DANGER y
+    // cualquier confirmación de ruptura del anchor. Mientras no vuelva a
+    // estar en -10% o peor, el HARD STOP es imposible.
     // --------------------------------------------------------
-    if (netValue <= dangerThreshold + 1e-9 && !recovery.dangerArmedAtMs) {
+    const dangerNow = netValue <= dangerThreshold + 1e-9;
+
+    if (!dangerNow) {
+      const hadDanger = Boolean(recovery.dangerArmedAtMs);
+      const hadAnchorBreakTimer = Boolean(recovery.anchorBreakBelowSinceMs);
+
+      if (hadDanger || hadAnchorBreakTimer || recovery.status === "RECOVERY_DANGER") {
+        recovery.status = "RECOVERY_HOLD";
+        recovery.dangerArmedAtMs = null;
+        recovery.dangerArmedAt = null;
+        recovery.anchorBreakBelowSinceMs = null;
+        recovery.anchorBreakBelowSince = null;
+
+        logEvent("✅ RECOVERY DANGER CLEARED ABOVE -10% — HOLD", {
+          recoveryId: recovery.id,
+          entryPrice: recovery.entryPrice,
+          investedUSDT: num(recovery.investedUSDT),
+          estimatedSellPrice: num(simulated.avgPrice, 6),
+          estimatedNetUSDT: num(netValue),
+          dangerThresholdNetUSDT: num(dangerThreshold),
+          lossPct: pct(lossPct),
+          low24hAnchor: num(recovery.low24hAnchor, 6),
+          hardStopBreakPrice: num(recovery.hardStopBreakPrice, 6),
+          action: "RESET_DANGER_AND_ANCHOR_CONFIRMATION"
+        });
+        saveState();
+      }
+
+      continue;
+    }
+
+    if (!recovery.dangerArmedAtMs) {
       recovery.status = "RECOVERY_DANGER";
       recovery.dangerArmedAtMs = now;
       recovery.dangerArmedAt = iso(now);
@@ -3194,8 +3919,7 @@ function checkRecoveryHardStops() {
       saveState();
     }
 
-    // Hasta llegar al -10% no existe posibilidad de hard stop.
-    if (!recovery.dangerArmedAtMs) continue;
+    // En este punto dangerNow es TRUE. Solo ahora puede evaluarse el hard stop.
 
     const anchor = Number(recovery.low24hAnchor);
     const hardStopBreakPrice = Number(
@@ -3307,10 +4031,10 @@ function checkRecoveryHardStops() {
 // RISK EXIT — SIN HORARIOS
 // ============================================================
 
-function maybeRiskExit(placementContext = null) {
-  if (state.mode !== "SELL_LIMIT" || !state.position) return false;
+function maybeRiskExit(positionId, placementContext = null) {
+  const position = openScalpPositions().find((p) => p.id === positionId);
+  if (!position) return false;
 
-  const position = state.position;
   const bid = bestBid();
   if (!bid) return false;
 
@@ -3320,38 +4044,28 @@ function maybeRiskExit(placementContext = null) {
   const momentum30s = priceMomentum(now, FAST_FLOW_WINDOW_MS);
   const holdMs = now - position.entryTimeMs;
   const priceMove = bid / position.entryPrice - 1;
-
-  // 1) RUPTURA ESTRUCTURAL CONFIRMADA.
-  // V5.1.8: NO vende. Migra la posición a RECOVERY_HOLD y crea
-  // BREAKDOWN_LOCK para impedir recomprar de inmediato el mismo soporte.
   const support = position.structuralSupportAtEntry;
 
   if (holdMs >= STOP_MIN_HOLD_MS && Number.isFinite(support) && support > 0) {
     const structuralBreakPrice = support * (1 - STRUCTURAL_STOP_BREAK_PCT);
-
     const confirmed =
       bid <= structuralBreakPrice &&
-      flow5m.askShare !== null &&
-      flow5m.askShare >= STOP_ASK_SHARE &&
-      flow30s.askShare !== null &&
-      flow30s.askShare >= STRUCTURAL_STOP_FAST_ASK_SHARE &&
-      momentum30s.move !== null &&
-      momentum30s.move <= -STRUCTURAL_STOP_MIN_DROP_30S;
+      flow5m.askShare !== null && flow5m.askShare >= STOP_ASK_SHARE &&
+      flow30s.askShare !== null && flow30s.askShare >= STRUCTURAL_STOP_FAST_ASK_SHARE &&
+      momentum30s.move !== null && momentum30s.move <= -STRUCTURAL_STOP_MIN_DROP_30S;
 
     if (confirmed) {
-      return moveActivePositionToRecovery("CONFIRMED_SUPPORT_BREAK", placementContext);
+      return moveActivePositionToRecovery(positionId, "CONFIRMED_SUPPORT_BREAK", placementContext);
     }
   }
 
-  // 2) STOP DEFENSIVO NORMAL. Puede gastar ganancias acumuladas,
-  // pero NO puede atravesar el capital floor.
   if (
     holdMs >= STOP_MIN_HOLD_MS &&
     flow5m.askShare !== null &&
     flow5m.askShare >= STOP_ASK_SHARE &&
     priceMove <= -STOP_PRICE_DROP
   ) {
-    return protectedMarketExit("SELL_PRESSURE");
+    return protectedMarketExit(positionId, "SELL_PRESSURE");
   }
 
   return false;
@@ -3376,6 +4090,161 @@ function updateDrawdown() {
       : 0;
 
   state.maxDrawdown = Math.max(state.maxDrawdown, dd);
+}
+
+// ============================================================
+// V5.2.0 — BOT RUN / PAUSE CONTROL
+// ============================================================
+
+function botControlSnapshot() {
+  return {
+    ok: true,
+    version: "5.2.0",
+    tradingEnabled: state.tradingEnabled !== false,
+    status: state.tradingEnabled !== false ? "RUNNING" : "PAUSED",
+    pausedAt: state.tradingPausedAt ?? null,
+    resumedAt: state.tradingResumedAt ?? null,
+    pendingBuy: state.buyOrder ? {
+      price: state.buyOrder.price,
+      target: state.buyOrder.target,
+      cash: state.buyOrder.cash,
+    } : null,
+    openScalpPositions: openScalpPositions().length,
+    openRecoveryPositions: state.recoveryPositions.length,
+    cash: num(state.cash),
+    equity: num(currentEquity()),
+    targetPriceDelta: currentTargetPriceDelta(),
+    operatingBank: currentOperatingBank(),
+    configurationEditable: state.tradingEnabled === false && !state.buyOrder &&
+      openScalpPositions().length === 0 && state.recoveryPositions.length === 0,
+    pauseBehavior: "NO_NEW_BUYS_EXISTING_POSITIONS_STILL_MANAGED",
+  };
+}
+
+function setBotConfiguration(payload = {}, source = "LOCAL_CONTROL") {
+  if (state.tradingEnabled !== false || state.buyOrder || openScalpPositions().length || state.recoveryPositions.length) {
+    return { ok: false, error: "CONFIG_REQUIRES_CLOSED_EMPTY_BOT" };
+  }
+
+  const targetPriceDelta = Number(payload.targetPriceDelta);
+  const operatingBank = Number(payload.operatingBank);
+  if (!Number.isFinite(targetPriceDelta) || targetPriceDelta < 0.0001 || targetPriceDelta > 1) {
+    return { ok: false, error: "TARGET_PRICE_DELTA_MUST_BE_BETWEEN_0.0001_AND_1" };
+  }
+  if (!Number.isFinite(operatingBank) || operatingBank <= 0 || operatingBank > 1_000_000_000) {
+    return { ok: false, error: "OPERATING_BANK_MUST_BE_GREATER_THAN_ZERO" };
+  }
+
+  const previous = {
+    targetPriceDelta: currentTargetPriceDelta(),
+    operatingBank: currentOperatingBank(),
+  };
+  state.targetPriceDelta = targetPriceDelta;
+  state.operatingBank = operatingBank;
+  logEvent("⚙️ BOT CONFIGURATION UPDATED", {
+    source,
+    previous,
+    targetPriceDelta,
+    operatingBank,
+  });
+  saveState();
+  return botControlSnapshot();
+}
+
+function setTradingEnabled(enabled, source = "LOCAL_CONTROL") {
+  const next = Boolean(enabled);
+  const previous = state.tradingEnabled !== false;
+  if (previous === next) return botControlSnapshot();
+
+  state.tradingEnabled = next;
+  if (next) {
+    state.tradingResumedAt = iso();
+    logEvent("▶️ BOT TRADING ENABLED", {
+      source,
+      action: "AUTOMATIC_ENTRIES_RESUMED",
+      targetPriceDelta: currentTargetPriceDelta(),
+      cash: num(state.cash),
+    });
+  } else {
+    state.tradingPausedAt = iso();
+    if (state.buyOrder) cancelBuy("BOT_PAUSED_BY_USER");
+    logEvent("⏸️ BOT TRADING PAUSED", {
+      source,
+      action: "NO_NEW_BUYS_EXISTING_POSITIONS_STILL_MANAGED",
+      openScalpPositions: openScalpPositions().length,
+      openRecoveryPositions: state.recoveryPositions.length,
+    });
+  }
+
+  saveState();
+  return botControlSnapshot();
+}
+
+function startBotControlApi() {
+  const server = http.createServer(async (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      return res.end();
+    }
+
+    const send = (statusCode, payload) => {
+      res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(payload));
+    };
+
+    const readJsonBody = () => new Promise((resolve, reject) => {
+      let body = "";
+      req.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 4096) reject(new Error("REQUEST_BODY_TOO_LARGE"));
+      });
+      req.on("end", () => {
+        try {
+          resolve(body ? JSON.parse(body) : {});
+        } catch {
+          reject(new Error("INVALID_JSON"));
+        }
+      });
+      req.on("error", reject);
+    });
+
+    const url = new URL(req.url, `http://${req.headers.host || `127.0.0.1:${BOT_CONTROL_PORT}`}`);
+
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/status")) {
+      return send(200, botControlSnapshot());
+    }
+    if (req.method === "POST" && url.pathname === "/open") {
+      return send(200, setTradingEnabled(true, "DASHBOARD_BUTTON"));
+    }
+    if (req.method === "POST" && url.pathname === "/close") {
+      return send(200, setTradingEnabled(false, "DASHBOARD_BUTTON"));
+    }
+    if (req.method === "POST" && url.pathname === "/configure") {
+      try {
+        const result = setBotConfiguration(await readJsonBody(), "DASHBOARD_CONFIG");
+        return send(result.ok ? 200 : result.error === "CONFIG_REQUIRES_CLOSED_EMPTY_BOT" ? 409 : 400, result);
+      } catch (error) {
+        return send(400, { ok: false, error: error.message });
+      }
+    }
+
+    return send(404, { ok: false, error: "NOT_FOUND" });
+  });
+
+  server.on("error", (error) => {
+    console.log(`⚠️ Bot control API ${BOT_CONTROL_PORT} no pudo iniciar:`, error.message);
+  });
+
+  server.listen(BOT_CONTROL_PORT, "127.0.0.1", () => {
+    console.log(`🎛️ Bot control API: http://127.0.0.1:${BOT_CONTROL_PORT}`);
+  });
+
+  return server;
 }
 
 // ============================================================
@@ -3404,7 +4273,7 @@ function maybeMark24hComplete() {
   state.test24hCompletedAt = iso();
 
   const summary = {
-    version: "5.1.8",
+    version: "5.2.0",
     testStartedAt: state.testStartedAt,
     testCompletedAt: state.test24hCompletedAt,
     elapsedHours: timing.elapsedHours,
@@ -3414,6 +4283,8 @@ function maybeMark24hComplete() {
     scalpCash: state.cash,
     pearl: state.pearl,
     mode: state.mode,
+    tradingEnabled: state.tradingEnabled !== false,
+    targetPriceDelta: currentTargetPriceDelta(),
     equity: currentEquity(),
     totalROI: state.capitalContributed > 0
       ? currentEquity() / state.capitalContributed - 1
@@ -3458,6 +4329,10 @@ function maybeMark24hComplete() {
     maxDrawdown: state.maxDrawdown,
 
     openPosition: state.position,
+    openPositions: openScalpPositions(),
+    openScalpPositionCount: openScalpPositions().length,
+    positionSpacingBlocks: state.positionSpacingBlocks || 0,
+    minimumPositionSpacingPct: MIN_POSITION_SPACING_PCT,
     pendingBuy: state.buyOrder,
     openRecoveries: state.recoveryPositions
   };
@@ -3501,13 +4376,14 @@ function maybeReady() {
   if (!liveReady && gotDepthSnapshot && (gotTradesSnapshot || gotLiveTrade || tradesRestBootstrapped)) {
     liveReady = true;
 
-    logEvent("✅ V5.1.8 READY", {
+    logEvent("✅ V5.2.0 READY", {
       historyTrades: recentTrades.length,
       bestBid: bestBid(),
       bestAsk: bestAsk(),
       ticker24hReady: Boolean(ticker24h),
       tradeBootstrap: gotTradesSnapshot ? "WS_SNAPSHOT" : (gotLiveTrade ? "WS_LIVE" : "REST_TRADES"),
-      targetGross: pct(TARGET_GROSS),
+      targetGross: pct(targetPctForEntry(bestAsk() || bestBid())),
+      targetPriceDelta: currentTargetPriceDelta(),
       testMode: "24H_CONTINUOUS"
     });
   }
@@ -3556,7 +4432,7 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
   });
   while (
     liveTradesSinceProcessStart.length &&
-    liveTradesSinceProcessStart[0].observedAtMs < now - 15 * 60 * 1000
+    liveTradesSinceProcessStart[0].observedAtMs < now - 30 * 60 * 1000
   ) {
     liveTradesSinceProcessStart.shift();
   }
@@ -3565,33 +4441,23 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
   recentTrades.sort((a, b) => a.time - b.time);
   trimHistory(trade.time);
 
-  // V5.1.8: el warm-up usa SOLO trades live del proceso actual.
-  // Tras 4 minutos, una caída activa puede crear FALLING_MARKET_LOCK incluso
-  // ANTES de que exista una posición atrapada.
   const preEntryLockCreated = maybeActivatePreEntryFallingLock(trade.price);
-  if (preEntryLockCreated && state.mode === "BUY_LIMIT" && state.buyOrder) {
-    cancelBuy("PREENTRY_FALLING_MARKET_LOCK");
+  if (preEntryLockCreated && state.buyOrder) {
+    cancelBuy("PREENTRY_HARD_FALLING_MARKET_LOCK");
   }
 
-  // SOLO trades live/causales actualizan/liberan el lock de caída.
   updateFallingMarketLock(trade.price);
-
-  // Recovery corre en paralelo al único scalp activo.
   updateBreakdownLocks(trade.price);
   processRecoveryTrade(trade, source, observationMeta);
   checkRecoveryHardStops();
 
   // ==========================================================
-  // BUY LIMIT PENDING
+  // ÚNICA BUY LIMIT PENDIENTE — puede coexistir con varias SELL.
   // ==========================================================
-
-  if (state.mode === "BUY_LIMIT" && state.buyOrder) {
+  if (state.buyOrder) {
     const order = state.buyOrder;
     const causal = causalFillAudit(order, trade, source, observationMeta);
 
-    // Un trade visto antes (o en el mismo lote que creó la orden) puede
-    // actualizar historial/métricas, pero NO puede confirmar, cancelar ni llenar
-    // una orden que todavía no existía cuando ese lote fue recibido.
     if (!causal.ok) {
       const relation = priceRelation(trade.price, order.price);
       if (relation < 0 || (relation === 0 && trade.side === "ASK")) {
@@ -3603,192 +4469,229 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
           ...causal
         });
       }
-      return;
-    }
+    } else {
+      const pendingSupportCaution = supportProximityContext(order.price);
 
-    const pendingZone = entryZoneContext(order.price, earlyArmMetric());
-    if (!pendingZone.ok) {
-      logEvent("🚫 PENDING BUY CANCELLED BY V5.1.8 ENTRY ZONE", {
-        orderPrice: order.price,
-        target: order.target,
-        high24h: pendingZone.ladder.high24h,
-        maxBuyExclusive: pendingZone.ladder.maxBuyExclusive,
-        nextUnlockResistance: pendingZone.ladder.nextUnlockResistance,
-        rangePosition24h: pendingZone.range.rangePosition24h,
-        rangeMode: pendingZone.range.mode,
-        ladderReason: pendingZone.ladder.reason,
-        rangeReason: pendingZone.range.reason
-      });
-      cancelBuy("ENTRY_ZONE_RELOCKED");
-      return;
-    }
-
-    // V5.1.8: la LIMIT se arma apenas existe una zona maker válida.
-    // Puede llenarse ANTES de que exista la señal dura. Si la señal completa
-    // aparece mientras ya estamos en el libro, solo la registramos:
-    // NO mueve la orden, NO reinicia TTL y NO es requisito para fill.
-    if (!order.hardSignalConfirmedAt) {
-      const hardSignalNow = buildHardSignal(true);
-
-      if (hardSignalNow?.ok) {
-        order.hardSignalConfirmedAt = iso();
-        order.hardSignalConfirmedAtMs = Date.now();
-        state.hardSignalsConfirmedWhileArmed =
-          (state.hardSignalsConfirmedWhileArmed || 0) + 1;
-
-        logEvent("✅ HARD SIGNAL CONFIRMED WHILE ARMED", {
+      if (
+        pendingSupportCaution.near &&
+        Number(order.allocationFraction || 1) > SUPPORT_CAUTION_CAPITAL_FRACTION + 1e-9
+      ) {
+        logEvent("🟠 PENDING BUY RESIZED — SUPPORT CAUTION", {
           orderPrice: order.price,
           target: order.target,
-          orderAgeSeconds: num(
-            (Date.now() - order.firstPlacedAtMs) / 1000,
-            2
-          ),
-          marketPrice: trade.price,
-          tradeExchangeTime: causal.tradeExchangeTime,
-          tradeObservedAt: causal.tradeObservedAt,
-          causalAgeMs: causal.causalAgeMs,
-          hardConditions: hardSignalNow.conditions
-        });
-      }
-    }
-
-    // TTL se comprueba ANTES de permitir que este trade llene
-    // una orden que ya debería haber expirado.
-    if (Date.now() - order.firstPlacedAtMs >= BUY_TTL_MS) {
-      cancelBuy("TTL_EXPIRED");
-      return;
-    }
-
-    // V5.1.8 — FILL REALISTA DE LIMIT MAKER.
-    // 1) Si un trade causal atraviesa nuestra BUY (trade < LIMIT), FULL FILL.
-    // 2) Si ocurre exactamente en la LIMIT, respeta cola + tamaño propio.
-    const buyRelation = priceRelation(trade.price, order.price);
-
-    if (buyRelation < 0) {
-      logEvent("⚡ BUY CROSS-THROUGH FILL", {
-        orderPrice: order.price,
-        tradePrice: trade.price,
-        tradeSide: trade.side,
-        tradeSource: source,
-        queueAhead: order.queueAhead,
-        qualifyingVolumeBeforeFill: order.qualifyingVolume,
-        orderPlacedAt: causal.orderPlacedAt,
-        tradeExchangeTime: causal.tradeExchangeTime,
-        tradeObservedAt: causal.tradeObservedAt,
-        causalAgeMs: causal.causalAgeMs,
-        exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
-      });
-
-      fillBuy({
-        method: "CROSS_THROUGH",
-        tradePrice: trade.price,
-        tradeSide: trade.side,
-        tradeSource: source,
-        tradeExchangeTime: causal.tradeExchangeTime,
-        tradeExchangeTimeMs: causal.tradeExchangeTimeMs,
-        tradeObservedAt: causal.tradeObservedAt,
-        tradeObservationBatchId: causal.batchId,
-        causalAgeMs: causal.causalAgeMs,
-        exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
-      });
-      return;
-    }
-
-    if (
-      buyRelation === 0 &&
-      trade.side === "ASK"
-    ) {
-      order.qualifyingVolume += trade.amount;
-
-      if (order.qualifyingVolume >= order.requiredFlow) {
-        fillBuy({
-          method: "AT_LIMIT_QUEUE_CONSUMED",
           tradePrice: trade.price,
-          tradeSide: trade.side,
-          tradeSource: source,
-          tradeExchangeTime: causal.tradeExchangeTime,
-          tradeExchangeTimeMs: causal.tradeExchangeTimeMs,
-          tradeObservedAt: causal.tradeObservedAt,
-          tradeObservationBatchId: causal.batchId,
-          causalAgeMs: causal.causalAgeMs,
-          exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
+          previousAllocationFraction: pct(order.allocationFraction || 1),
+          nextAllocationFraction: pct(SUPPORT_CAUTION_CAPITAL_FRACTION),
+          supportPrice: num(pendingSupportCaution.price, 6),
+          supportDistance: pct(pendingSupportCaution.distancePct),
+          action: "CANCEL_AND_REARM_AT_SUPPORT_CAUTION"
         });
-        return;
+        cancelBuy("SUPPORT_CAUTION_RESIZE");
+      } else if (
+        !pendingSupportCaution.near &&
+        Number(order.allocationFraction || 1) < 1 - 1e-9
+      ) {
+        logEvent("🟢 PENDING BUY RESIZED — SUPPORT CAUTION RELEASED", {
+          orderPrice: order.price,
+          target: order.target,
+          tradePrice: trade.price,
+          previousAllocationFraction: pct(order.allocationFraction || 1),
+          nextAllocationFraction: pct(1),
+          supportPrice: num(pendingSupportCaution.price, 6),
+          supportDistance: pct(pendingSupportCaution.distancePct),
+          action: "CANCEL_AND_REARM_AT_FULL_CAPITAL"
+        });
+        cancelBuy("SUPPORT_CAUTION_RELEASED");
+      }
+
+      if (state.buyOrder) {
+        const pendingZone = entryZoneContext(order.price, earlyArmMetric());
+        const pendingSpacing = positionSpacingContext(order.price);
+
+        if (!pendingZone.ok || !pendingSpacing.ok) {
+          logEvent(
+            !pendingSpacing.ok
+              ? "↔️ PENDING BUY CANCELLED BY POSITION SPACING"
+              : "🚫 PENDING BUY CANCELLED BY V5.1.8.3 ENTRY ZONE",
+            {
+              orderPrice: order.price,
+              target: order.target,
+              nearestEntry: pendingSpacing.nearestEntry,
+              nearestDistance: pct(pendingSpacing.nearestDistancePct),
+              high24h: pendingZone.ladder.high24h,
+              maxBuyExclusive: pendingZone.ladder.maxBuyExclusive,
+              nextUnlockResistance: pendingZone.ladder.nextUnlockResistance,
+              rangePosition24h: pendingZone.range.rangePosition24h,
+              rangeMode: pendingZone.range.mode,
+              ladderReason: pendingZone.ladder.reason,
+              rangeReason: pendingZone.range.reason
+            }
+          );
+          cancelBuy(!pendingSpacing.ok ? "POSITION_SPACING_RELOCKED" : "ENTRY_ZONE_RELOCKED");
+        }
+      }
+
+      if (state.buyOrder) {
+        if (!order.hardSignalConfirmedAt) {
+          const hardSignalNow = buildHardSignal(true);
+          if (hardSignalNow?.ok) {
+            order.hardSignalConfirmedAt = iso();
+            order.hardSignalConfirmedAtMs = Date.now();
+            state.hardSignalsConfirmedWhileArmed =
+              (state.hardSignalsConfirmedWhileArmed || 0) + 1;
+
+            logEvent("✅ HARD SIGNAL CONFIRMED WHILE ARMED", {
+              orderPrice: order.price,
+              target: order.target,
+              orderAgeSeconds: num((Date.now() - order.firstPlacedAtMs) / 1000, 2),
+              marketPrice: trade.price,
+              tradeExchangeTime: causal.tradeExchangeTime,
+              tradeObservedAt: causal.tradeObservedAt,
+              causalAgeMs: causal.causalAgeMs,
+              hardConditions: hardSignalNow.conditions
+            });
+          }
+        }
+
+        if (Date.now() - order.firstPlacedAtMs >= BUY_TTL_MS) {
+          cancelBuy("TTL_EXPIRED");
+        }
+      }
+
+      if (state.buyOrder) {
+        const supportRearm = pendingSupportRearmContext(order, trade.price);
+        if (supportRearm.rearm) {
+          logEvent("↘️ BUY LIMIT REARMED TOWARD SUPPORT", {
+            oldOrderPrice: order.price,
+            marketPrice: trade.price,
+            oldSupportSource: order.supportEntry?.source ?? null,
+            nextSupportSource: supportRearm.next?.source ?? null,
+            nextSupportPrice: num(supportRearm.next?.buyPrice, 6),
+            nextSupportDistance: pct(supportRearm.next?.distancePct),
+            reason: supportRearm.reason
+          });
+          cancelBuy("SUPPORT_RELOCATED_DOWN");
+        }
+      }
+
+      if (state.buyOrder) {
+        const buyRelation = priceRelation(trade.price, order.price);
+
+        if (buyRelation < 0) {
+          logEvent("⚡ BUY CROSS-THROUGH FILL", {
+            orderPrice: order.price,
+            tradePrice: trade.price,
+            tradeSide: trade.side,
+            tradeSource: source,
+            queueAhead: order.queueAhead,
+            qualifyingVolumeBeforeFill: order.qualifyingVolume,
+            orderPlacedAt: causal.orderPlacedAt,
+            tradeExchangeTime: causal.tradeExchangeTime,
+            tradeObservedAt: causal.tradeObservedAt,
+            causalAgeMs: causal.causalAgeMs,
+            exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
+          });
+
+          fillBuy({
+            method: "CROSS_THROUGH",
+            tradePrice: trade.price,
+            tradeSide: trade.side,
+            tradeSource: source,
+            tradeExchangeTime: causal.tradeExchangeTime,
+            tradeExchangeTimeMs: causal.tradeExchangeTimeMs,
+            tradeObservedAt: causal.tradeObservedAt,
+            tradeObservationBatchId: causal.batchId,
+            causalAgeMs: causal.causalAgeMs,
+            exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
+          });
+        } else if (buyRelation === 0 && trade.side === "ASK") {
+          order.qualifyingVolume += trade.amount;
+
+          if (order.qualifyingVolume >= order.requiredFlow) {
+            fillBuy({
+              method: "AT_LIMIT_QUEUE_CONSUMED",
+              tradePrice: trade.price,
+              tradeSide: trade.side,
+              tradeSource: source,
+              tradeExchangeTime: causal.tradeExchangeTime,
+              tradeExchangeTimeMs: causal.tradeExchangeTimeMs,
+              tradeObservedAt: causal.tradeObservedAt,
+              tradeObservationBatchId: causal.batchId,
+              causalAgeMs: causal.causalAgeMs,
+              exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
+            });
+          }
+        }
+      }
+
+      if (state.buyOrder) {
+        const flow5m = flowMetrics();
+        const flow30s = flowMetrics(Date.now(), FAST_FLOW_WINDOW_MS);
+        const momentum30s = priceMomentum(Date.now(), FAST_FLOW_WINDOW_MS);
+        const orderAgeMs = Date.now() - order.firstPlacedAtMs;
+        const breakPrice = order.price * (1 - PENDING_BREAK_BELOW_BUY);
+        const distanceFromBuy = trade.price / order.price - 1;
+        const graceElapsed = orderAgeMs >= PENDING_CANCEL_GRACE_MS;
+        const materiallyBelowBuy = trade.price <= breakPrice;
+        const fastSellPressure =
+          flow30s.askShare !== null &&
+          flow30s.askShare >= PENDING_CANCEL_FAST_ASK_SHARE;
+        const fastPriceStillFalling =
+          momentum30s.move !== null &&
+          momentum30s.move <= -PENDING_CANCEL_MIN_DROP_30S;
+
+        if (
+          graceElapsed &&
+          materiallyBelowBuy &&
+          fastSellPressure &&
+          fastPriceStillFalling
+        ) {
+          logEvent("⚠️ BUY STRUCTURAL BREAK CONFIRMED", {
+            orderPrice: order.price,
+            breakPrice,
+            marketPrice: trade.price,
+            distanceFromBuy,
+            orderAgeSeconds: orderAgeMs / 1000,
+            askShare5m: flow5m.askShare,
+            bidShare5m: flow5m.bidShare,
+            askShare30s: flow30s.askShare,
+            bidShare30s: flow30s.bidShare,
+            priceMove30s: momentum30s.move
+          });
+
+          cancelBuy("STRUCTURAL_BREAK_BELOW_BUY");
+        }
       }
     }
-
-    // V5.1.8: una orden colocada para capturar un retroceso NO debe
-    // cancelarse simplemente porque el precio toque o atraviese unos ticks.
-    const flow5m = flowMetrics();
-    const flow30s = flowMetrics(Date.now(), FAST_FLOW_WINDOW_MS);
-    const momentum30s = priceMomentum(Date.now(), FAST_FLOW_WINDOW_MS);
-
-    const orderAgeMs = Date.now() - order.firstPlacedAtMs;
-    const breakPrice = order.price * (1 - PENDING_BREAK_BELOW_BUY);
-    const distanceFromBuy = trade.price / order.price - 1;
-
-    const graceElapsed = orderAgeMs >= PENDING_CANCEL_GRACE_MS;
-    const materiallyBelowBuy = trade.price <= breakPrice;
-    const fastSellPressure =
-      flow30s.askShare !== null &&
-      flow30s.askShare >= PENDING_CANCEL_FAST_ASK_SHARE;
-    const fastPriceStillFalling =
-      momentum30s.move !== null &&
-      momentum30s.move <= -PENDING_CANCEL_MIN_DROP_30S;
-
-    if (
-      graceElapsed &&
-      materiallyBelowBuy &&
-      fastSellPressure &&
-      fastPriceStillFalling
-    ) {
-      logEvent("⚠️ BUY STRUCTURAL BREAK CONFIRMED", {
-        orderPrice: order.price,
-        breakPrice,
-        marketPrice: trade.price,
-        distanceFromBuy,
-        orderAgeSeconds: orderAgeMs / 1000,
-        askShare5m: flow5m.askShare,
-        bidShare5m: flow5m.bidShare,
-        askShare30s: flow30s.askShare,
-        bidShare30s: flow30s.bidShare,
-        priceMove30s: momentum30s.move
-      });
-
-      cancelBuy("STRUCTURAL_BREAK_BELOW_BUY");
-      return;
-    }
-
-    return;
   }
 
   // ==========================================================
-  // POSITION OPEN / SELL LIMIT
+  // TODAS LAS SELL LIMIT ABIERTAS — independientes por posición.
   // ==========================================================
+  for (const position of [...openScalpPositions()]) {
+    const sell = position.sellOrder;
+    if (!sell) continue;
 
-  if (state.mode === "SELL_LIMIT" && state.sellOrder) {
-    const sell = state.sellOrder;
     const causal = causalFillAudit(sell, trade, source, observationMeta);
+    const sellRelation = priceRelation(trade.price, sell.price);
 
     if (!causal.ok) {
-      const relation = priceRelation(trade.price, sell.price);
-      if (relation > 0 || (relation === 0 && trade.side === "BID")) {
+      if (sellRelation > 0 || (sellRelation === 0 && trade.side === "BID")) {
         state.causalSellFillsBlocked = (state.causalSellFillsBlocked || 0) + 1;
         logEvent("⏱️ SELL FILL BLOCKED BY CAUSALITY", {
+          positionId: position.id,
           orderPrice: sell.price,
           tradePrice: trade.price,
           tradeSide: trade.side,
           ...causal
         });
       }
-      return;
+      continue;
     }
-
-    // V5.1.8 — target +0.45% con fill causal y cross-through.
-    const sellRelation = priceRelation(trade.price, sell.price);
 
     if (sellRelation > 0) {
       logEvent("⚡ SELL CROSS-THROUGH FILL", {
+        positionId: position.id,
         orderPrice: sell.price,
         tradePrice: trade.price,
         tradeSide: trade.side,
@@ -3802,7 +4705,7 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
         exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
       });
 
-      normalTargetSell({
+      normalTargetSell(position.id, {
         method: "CROSS_THROUGH",
         tradePrice: trade.price,
         tradeSide: trade.side,
@@ -3814,17 +4717,14 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
         causalAgeMs: causal.causalAgeMs,
         exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
       });
-      return;
+      continue;
     }
 
-    if (
-      sellRelation === 0 &&
-      trade.side === "BID"
-    ) {
+    if (sellRelation === 0 && trade.side === "BID") {
       sell.qualifyingVolume += trade.amount;
 
       if (sell.qualifyingVolume >= sell.requiredFlow) {
-        normalTargetSell({
+        normalTargetSell(position.id, {
           method: "AT_LIMIT_QUEUE_CONSUMED",
           tradePrice: trade.price,
           tradeSide: trade.side,
@@ -3836,35 +4736,28 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
           causalAgeMs: causal.causalAgeMs,
           exchangeAgeVsOrderMs: causal.exchangeAgeVsOrderMs
         });
-        return;
+        continue;
       }
     }
 
-    maybeRiskExit({
+    maybeRiskExit(position.id, {
       batchId: observationMeta?.batchId ?? null,
       tradeTimeMs: trade.time,
       source
     });
-    return;
   }
 
   // ==========================================================
-  // WAITING
+  // NUEVA BUY — mismas protecciones aunque existan SELL abiertas.
   // ==========================================================
-
-  if (state.mode === "WAITING" && state.cash >= MIN_SCALP_CASH_USDT) {
+  if (state.tradingEnabled && !state.buyOrder && state.cash >= MIN_SCALP_CASH_USDT) {
     const startup = startupContextStatus(trade.price);
-    if (!startup.ready) {
-      return;
-    }
+    if (!startup.ready) return;
 
     maybeActivatePreEntryFallingLock(trade.price);
-    if (activeFallingMarketLock()) {
-      return;
-    }
+    if (activeFallingMarketLock()) return;
 
     const earlySignal = buildEarlyArmSignal();
-
     if (earlySignal?.ok) {
       placeBuyLimit(earlySignal, {
         batchId: observationMeta?.batchId ?? null,
@@ -3876,7 +4769,7 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
 }
 
 // ============================================================
-// V5.1.8 — LIVE TRADE EXTRACTION + REST FALLBACK
+// V5.1.8.3 — LIVE TRADE EXTRACTION + REST FALLBACK
 // ============================================================
 
 function extractLiveTradeUpdates(msg) {
@@ -3942,7 +4835,7 @@ async function refreshTradesRest(reason = "POLL") {
       return true;
     }
 
-    // V5.1.8: todos los trades de esta respuesta REST comparten el MISMO
+    // V5.1.8.3: todos los trades de esta respuesta REST comparten el MISMO
     // momento de observación. Si una orden nace mientras procesamos este lote,
     // ningún otro trade del mismo lote puede llenarla: ya estaba recibido.
     const observedAtMs = Date.now();
@@ -3972,14 +4865,39 @@ async function refreshTradesRest(reason = "POLL") {
 let ws = null;
 let pingTimer = null;
 let reconnectTimer = null;
+let wsReconnectDelayMs = 5000;
+let wsErrorKey = null;
+let wsErrorLoggedAtMs = 0;
+let wsErrorSuppressed = 0;
+
+function startRestFallbacks() {
+  if (!tickerRestTimer) {
+    refreshTicker24hRest("BOOTSTRAP");
+    tickerRestTimer = setInterval(() => {
+      refreshTicker24hRest("POLL");
+    }, 60 * 1000);
+  }
+
+  if (!tradesRestTimer) {
+    refreshTradesRest("BOOTSTRAP");
+    tradesRestTimer = setInterval(() => {
+      const wsStale =
+        lastWsLiveTradeAtMs === null ||
+        Date.now() - lastWsLiveTradeAtMs >= 10 * 1000;
+
+      if (wsStale) refreshTradesRest("POLL");
+    }, 5 * 1000);
+  }
+}
 
 function connect() {
   gotDepthSnapshot = false;
   gotTradesSnapshot = false;
   gotLiveTrade = false;
   liveReady = false;
+  startRestFallbacks();
 
-  console.log("\n🔌 Conectando V5.1.8...");
+  console.log("\n🔌 Conectando V5.2.0...");
 
   ws = new WebSocket(WS_URL, "json", {
     handshakeTimeout: 15000,
@@ -3987,7 +4905,14 @@ function connect() {
   });
 
   ws.on("open", () => {
-    console.log("✅ BIGONE CONNECTED V5.1.8");
+    console.log("✅ BIGONE CONNECTED V5.2.0");
+    wsReconnectDelayMs = 5000;
+    if (wsErrorSuppressed > 0) {
+      logEvent("✅ WS RECOVERED", { suppressedErrors: wsErrorSuppressed });
+    }
+    wsErrorKey = null;
+    wsErrorLoggedAtMs = 0;
+    wsErrorSuppressed = 0;
 
     ws.send(
       JSON.stringify({
@@ -4016,27 +4941,6 @@ function connect() {
         }
       })
     );
-
-    // WebSocket es la fuente principal. REST sirve como bootstrap/fallback
-    // para garantizar high/low 24h incluso si el formato push cambia.
-    refreshTicker24hRest("BOOTSTRAP");
-
-    clearInterval(tickerRestTimer);
-    tickerRestTimer = setInterval(() => {
-      refreshTicker24hRest("POLL");
-    }, 60 * 1000);
-
-    // Bootstrap/fallback de trades públicos. El primer fetch solo llena
-    // contexto histórico; desde el segundo poll solo procesa trades nuevos.
-    refreshTradesRest("BOOTSTRAP");
-    clearInterval(tradesRestTimer);
-    tradesRestTimer = setInterval(() => {
-      const wsStale =
-        lastWsLiveTradeAtMs === null ||
-        Date.now() - lastWsLiveTradeAtMs >= 10 * 1000;
-
-      if (wsStale) refreshTradesRest("POLL");
-    }, 5 * 1000);
 
     clearInterval(pingTimer);
 
@@ -4082,8 +4986,8 @@ function connect() {
       updateDrawdown();
       checkRecoveryHardStops();
 
-      if (state.mode === "SELL_LIMIT") {
-        maybeRiskExit();
+      for (const position of [...openScalpPositions()]) {
+        maybeRiskExit(position.id);
       }
     }
 
@@ -4131,29 +5035,41 @@ function connect() {
   });
 
   ws.on("error", (error) => {
-    logEvent("❌ WS ERROR", {
-      message: error.message
-    });
+    const key = `${error.code ?? ""}:${error.message ?? "unknown"}`;
+    const now = Date.now();
+    if (key !== wsErrorKey || now - wsErrorLoggedAtMs >= 60 * 1000) {
+      logEvent("❌ WS ERROR", {
+        message: error.message,
+        code: error.code ?? null,
+        retryDelayMs: wsReconnectDelayMs,
+        suppressedErrors: wsErrorSuppressed,
+      });
+      wsErrorKey = key;
+      wsErrorLoggedAtMs = now;
+      wsErrorSuppressed = 0;
+    } else {
+      wsErrorSuppressed += 1;
+    }
   });
 
   ws.on("close", (code, reason) => {
     clearInterval(pingTimer);
-    clearInterval(tickerRestTimer);
-    clearInterval(tradesRestTimer);
 
     console.log("🔌 DISCONNECTED", code, reason.toString());
 
     if (reconnectTimer) return;
 
+    const delay = wsReconnectDelayMs;
+    wsReconnectDelayMs = Math.min(wsReconnectDelayMs * 2, 60 * 1000);
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connect();
-    }, 5000);
+    }, delay);
   });
 }
 
 // ============================================================
-// V5.1.8 — ENTRY DIAGNOSTICS / MARKET HEALTH
+// V5.1.8.3 — ENTRY DIAGNOSTICS / MARKET HEALTH
 // ============================================================
 
 function entryDiagnostics() {
@@ -4220,9 +5136,10 @@ function liveJsonStatus() {
   const diag = entryDiagnostics();
   const timing = testTiming();
   const supportPreview = supportContext60m(currentPrice);
+  const structure120 = structure120m(currentPrice);
   const rangePosition24h = tickerRangePosition24h(currentPrice);
-  const previewBuyPrice = proposedBuyPrice();
-  const previewTarget = previewBuyPrice ? roundUp(previewBuyPrice * (1 + TARGET_GROSS)) : null;
+  const previewBuyPrice = proposedBuyPrice(currentPrice);
+  const previewTarget = previewBuyPrice ? targetPriceForEntry(previewBuyPrice) : null;
   const startup = startupContextStatus(currentPrice);
   const preEntry = preEntryFallingContext(currentPrice);
   const highRange = highRangeCautionContext(displayMetric);
@@ -4239,22 +5156,36 @@ function liveJsonStatus() {
     ...base,
     generatedAt: iso(),
     processId: process.pid,
-    version: "5.1.8",
+    version: "5.2.0",
     localTime: localClock().text,
     testMode: "24H_CONTINUOUS",
     testElapsedHours: num(timing.elapsedHours, 2),
     testRemainingHours: num(timing.remainingHours, 2),
     test24hComplete: state.test24hCompleteLogged,
     mode: state.mode,
+    botControl: {
+      tradingEnabled: state.tradingEnabled !== false,
+      status: state.tradingEnabled !== false ? "RUNNING" : "PAUSED",
+      pausedAt: state.tradingPausedAt ?? null,
+      resumedAt: state.tradingResumedAt ?? null,
+      pauseBehavior: "NO_NEW_BUYS_EXISTING_POSITIONS_STILL_MANAGED",
+      controlPort: BOT_CONTROL_PORT,
+      targetPriceDelta: currentTargetPriceDelta(),
+      operatingBank: currentOperatingBank(),
+      configurationEditable: state.tradingEnabled === false && !state.buyOrder &&
+        openScalpPositions().length === 0 && state.recoveryPositions.length === 0,
+    },
     scalpCash: num(state.cash),
     capitalContributed: num(state.capitalContributed),
+    operatingBank: currentOperatingBank(),
     pearl: num(state.pearl),
     recoveryEquity: num(recoveryEquity()),
     equity: num(currentEquity()),
     ROI: state.capitalContributed > 0 ? pct(currentEquity() / state.capitalContributed - 1) : null,
     realizedProfit: num(state.realizedProfit),
     cycles: state.cycles,
-    targetGross: pct(TARGET_GROSS),
+    targetGross: pct(targetPctForEntry(previewBuyPrice || currentPrice)),
+    targetPriceDelta: currentTargetPriceDelta(),
     lastPrice: currentPrice,
     recentLow: displayMetric?.low ?? null,
     recentHigh: displayMetric?.high ?? null,
@@ -4277,6 +5208,7 @@ function liveJsonStatus() {
     bestBid: bestBid(),
     bestAsk: bestAsk(),
     marketSpreadObserved: pct(marketSpreadObserved()),
+    structure120m: structure120Snapshot(structure120),
     downsideContext: {
       ...(base.downsideContext || {}),
       support60m: num(supportPreview.support?.price, 4),
@@ -4301,8 +5233,8 @@ function liveJsonStatus() {
       rangePositionEntryGate: previewBuyPrice ? rangePositionEntryContext(previewBuyPrice) : null,
     },
     entryEngine: diag,
-    regimeV518: {
-      ...(base.regimeV518 || {}),
+    regimeV519: {
+      ...(base.regimeV519 || {}),
       startupContext: {
         locked: startup.locked,
         ready: startup.ready,
@@ -4315,6 +5247,11 @@ function liveJsonStatus() {
       },
       preEntryFalling: {
         active: preEntry.active,
+        regime: preEntry.regime,
+        hardLock: preEntry.hardLock,
+        softCaution: preEntry.softCaution,
+        hardShock: preEntry.hardShock,
+        hardSlowBleed: preEntry.hardSlowBleed,
         directionalDrop: preEntry.directionalDrop,
         confirmingVotes: preEntry.confirmingVotes,
         move4m: pct(preEntry.move4m),
@@ -4325,6 +5262,22 @@ function liveJsonStatus() {
         microDrop: preEntry.microDrop,
         nearLow: preEntry.nearLow,
       },
+      entryStability: (() => {
+        const e = entryStabilityContext(currentPrice);
+        return {
+          ok: e.ok,
+          required: e.required,
+          stableEnough: e.stableEnough,
+          failedConditions: e.failedConditions?.join(", ") || null,
+          dropFromHigh15m: pct(e.dropFromHigh15m),
+          move10m: pct(e.move10m),
+          move5m: pct(e.move5m),
+          momentum30s: pct(e.momentum30s),
+          askShare5m: pct(e.askShare5m),
+          minutesSinceLow: num(e.minutesSinceLow, 2),
+          bounceFromLow5m: pct(e.bounceFromLow5m)
+        };
+      })(),
       entryZone: {
         ok: zone.ok,
         high24h: num(zone.ladder.high24h, 4),
@@ -4337,8 +5290,18 @@ function liveJsonStatus() {
         rangeMode: zone.range.mode,
         rangeOK: zone.range.ok,
         rangeReason: zone.range.reason,
+        supportEntryOK: zone.supportEntryOK,
+        supportEntrySource: zone.supportEntry?.source ?? null,
+        supportEntryPrice: num(zone.supportEntry?.buyPrice, 6),
+        supportEntryDistancePct: num(zone.supportEntry?.distancePct),
         capitalFractionIfBuy: allocation ? pct(allocation.fraction) : null,
+        effectiveCapitalToUseIfBuy: allocation ? num(allocation.capital) : null,
+        multiPositionSlotCapIfBuy: allocation ? num(allocation.slotCap) : null,
+        effectiveCashFractionIfBuy: allocation && state.cash > 0 ? pct(allocation.capital / state.cash) : null,
         allocationModeIfBuy: allocation?.mode ?? null,
+        supportCautionIfBuy: allocation?.supportCaution?.near ?? null,
+        supportPriceIfBuy: num(allocation?.supportCaution?.price, 6),
+        supportDistancePctIfBuy: pct(allocation?.supportCaution?.distancePct),
       },
       highRangeCaution: {
         active: highRange.active,
@@ -4361,15 +5324,37 @@ function liveJsonStatus() {
     askShare30s: pct(flow30s.askShare),
     bidShare30s: pct(flow30s.bidShare),
     priceMove30s: pct(momentum30s.move),
+    openScalpPositions: openScalpPositions().map((p) => ({
+      id: p.id,
+      entry: p.entryPrice,
+      targetPlusOneCent: p.sellTarget,
+      investedUSDT: num(p.investedUSDT),
+      pearl: num(p.pearlReceived),
+      allocationMode: p.allocationMode ?? "NORMAL_SCALP",
+      allocationFraction: pct(p.allocationFraction ?? 1),
+      supportCaution: p.supportCautionAtEntry ?? null,
+      heldMinutes: num((Date.now() - p.entryTimeMs) / 60000, 2),
+      sellOrderPlacedAt: p.sellOrder?.placedAt ?? null
+    })),
+    openScalpPositionCount: openScalpPositions().length,
+    multiPositionSlotFraction: pct(MULTI_POSITION_MAX_CAPITAL_FRACTION),
+    minimumPositionSpacing: pct(MIN_POSITION_SPACING_PCT),
+
     pendingBuy: state.buyOrder
       ? {
           ...(base.pendingBuy || {}),
           price: state.buyOrder.price,
           target: state.buyOrder.target,
+          staticPrice: false,
+          supportRearmEnabled: true,
+          supportEntry: state.buyOrder.supportEntry ?? null,
           entrySignalType: state.buyOrder.entrySignalType ?? null,
           allocationMode: state.buyOrder.allocationMode ?? "NORMAL_SCALP",
           capitalToUse: num(state.buyOrder.cash),
           capitalFraction: pct(state.buyOrder.allocationFraction ?? 1),
+          supportCaution: state.buyOrder.supportCaution ?? null,
+          multiPositionSlotCap: num(state.buyOrder.multiPositionSlotCap),
+          openScalpPositions: openScalpPositions().length,
           hardSignalConfirmed: Boolean(state.buyOrder.hardSignalConfirmedAt),
           ageSeconds: num((Date.now() - state.buyOrder.firstPlacedAtMs) / 1000, 1),
           ttlRemainingSeconds: num(Math.max(0, BUY_TTL_MS - (Date.now() - state.buyOrder.firstPlacedAtMs)) / 1000, 1),
@@ -4377,14 +5362,17 @@ function liveJsonStatus() {
           marketDistanceFromBuy: metric?.current ? pct(metric.current / state.buyOrder.price - 1) : null,
         }
       : null,
-    position: state.position ? { ...(base.position || {}), entry: state.position.entryPrice, target045: state.position.sellTarget } : null,
+    position: state.position ? { ...(base.position || {}), entry: state.position.entryPrice, targetPlusOneCent: state.position.sellTarget } : null,
     recovery: base.recovery || { positions: state.recoveryPositions || [], activeBreakdownLocks: [] },
     protectedCapitalFloor: num(protectedCapitalFloor()),
     peakRealizedProfit: num(state.peakRealizedProfit),
     riskableProfitBuffer: num(riskableProfitBuffer()),
-    marketExitNetNow: state.mode === "SELL_LIMIT" ? num(simulateMarketSell(state.pearl)?.netUSDT) : null,
-    marketExitWouldRespectFloor: state.mode === "SELL_LIMIT"
-      ? (() => { const sim = simulateMarketSell(state.pearl); return sim ? sim.netUSDT + 1e-9 >= protectedCapitalFloor() : null; })()
+    marketExitNetNow: state.position ? num(simulateMarketSell(state.position.pearlReceived, buyFeeUSDT(state.position))?.netUSDT) : null,
+    marketExitWouldRespectFloor: state.position
+      ? (() => {
+          const sim = simulateMarketSell(state.position.pearlReceived, buyFeeUSDT(state.position));
+          return sim ? sim.netUSDT + 1e-9 >= protectedCapitalFloor(state.position) : null;
+        })()
       : null,
     buysPlaced: state.buyOrdersPlaced,
     earlyBuysArmed: state.earlyBuyOrdersArmed || 0,
@@ -4405,9 +5393,14 @@ function liveJsonStatus() {
     breakdownLocksCreated: state.breakdownLocksCreated || 0,
     breakdownLocksReleased: state.breakdownLocksReleased || 0,
     highRangeCautionOrders: state.highRangeCautionOrders || 0,
+    softFallingCautionOrders: state.softFallingCautionOrders || 0,
+    entryStabilityBlocks: state.entryStabilityBlocks || 0,
+    entryStabilityCancels: state.entryStabilityCancels || 0,
     fallingMarketLocksCreated: state.fallingMarketLocksCreated || 0,
     fallingMarketLocksReleased: state.fallingMarketLocksReleased || 0,
     fallingMarketEntriesBlocked: state.fallingMarketEntriesBlocked || 0,
+    positionSpacingBlocks: state.positionSpacingBlocks || 0,
+    scalpPositionsOpened: state.scalpPositionsOpened || 0,
     maxDrawdown: pct(state.maxDrawdown),
   };
 }
@@ -4419,7 +5412,6 @@ function liveJsonStatus() {
 setInterval(() => {
   // Expira una BUY aunque durante unos segundos no llegue ningún trade.
   if (
-    state.mode === "BUY_LIMIT" &&
     state.buyOrder &&
     Date.now() - state.buyOrder.firstPlacedAtMs >= BUY_TTL_MS
   ) {
@@ -4440,15 +5432,15 @@ setInterval(() => {
   const equity = currentEquity();
   const timing = testTiming();
 
-  const previewBuyPrice = proposedBuyPrice();
+  const previewBuyPrice = proposedBuyPrice(displayMetric?.current ?? marketRef?.price ?? null);
   const previewTarget = previewBuyPrice
-    ? roundUp(previewBuyPrice * (1 + TARGET_GROSS))
+    ? targetPriceForEntry(previewBuyPrice)
     : null;
 
   const supportPreview = supportContext60m(displayMetric?.current ?? marketRef?.price ?? null);
   const rangePosition24h = tickerRangePosition24h(displayMetric?.current ?? marketRef?.price ?? null);
   const entryDiag = entryDiagnostics();
-  if (activeFallingMarketLock() && state.mode === "WAITING" && state.cash >= MIN_SCALP_CASH_USDT) {
+  if (state.tradingEnabled && activeFallingMarketLock() && !state.buyOrder && state.cash >= MIN_SCALP_CASH_USDT) {
     state.fallingMarketEntriesBlocked = (state.fallingMarketEntriesBlocked || 0) + 1;
   }
 
@@ -4462,7 +5454,7 @@ setInterval(() => {
       ? state.sellOrder.qualifyingVolume / state.sellOrder.requiredFlow
       : null;
 
-  console.log("\n========== V5.1.8 STATUS ==========");
+  console.log("\n========== V5.2.0 STATUS ==========");
 
   const statusSnapshot = {
     localTime: localClock().text,
@@ -4473,6 +5465,7 @@ setInterval(() => {
     test24hComplete: state.test24hCompleteLogged,
 
     mode: state.mode,
+    botStatus: state.tradingEnabled !== false ? "RUNNING" : "PAUSED",
 
     scalpCash: num(state.cash),
     capitalContributed: num(state.capitalContributed),
@@ -4485,7 +5478,8 @@ setInterval(() => {
     realizedProfit: num(state.realizedProfit),
     cycles: state.cycles,
 
-    targetGross: pct(TARGET_GROSS),
+    targetGross: pct(targetPctForEntry(previewBuyPrice || displayMetric?.current || marketRef?.price)),
+    targetPriceDelta: currentTargetPriceDelta(),
 
     lastPrice: displayMetric?.current ?? marketRef?.price ?? null,
     recentLow: displayMetric?.low ?? null,
@@ -4552,7 +5546,7 @@ setInterval(() => {
 
     entryEngine: entryDiag,
 
-    regimeV518: {
+    regimeV519: {
       startupContext: (() => {
         const st = startupContextStatus(displayMetric?.current ?? marketRef?.price ?? null);
         return {
@@ -4570,6 +5564,11 @@ setInterval(() => {
         const f = preEntryFallingContext(displayMetric?.current ?? marketRef?.price ?? null);
         return {
           active: f.active,
+          regime: f.regime,
+          hardLock: f.hardLock,
+          softCaution: f.softCaution,
+          hardShock: f.hardShock,
+          hardSlowBleed: f.hardSlowBleed,
           directionalDrop: f.directionalDrop,
           confirmingVotes: f.confirmingVotes,
           move4m: pct(f.move4m),
@@ -4579,6 +5578,22 @@ setInterval(() => {
           sellPressure: f.sellPressure,
           microDrop: f.microDrop,
           nearLow: f.nearLow
+        };
+      })(),
+      entryStability: (() => {
+        const e = entryStabilityContext(displayMetric?.current ?? marketRef?.price ?? null);
+        return {
+          ok: e.ok,
+          required: e.required,
+          stableEnough: e.stableEnough,
+          failedConditions: e.failedConditions?.join(", ") || null,
+          dropFromHigh15m: pct(e.dropFromHigh15m),
+          move10m: pct(e.move10m),
+          move5m: pct(e.move5m),
+          momentum30s: pct(e.momentum30s),
+          askShare5m: pct(e.askShare5m),
+          minutesSinceLow: num(e.minutesSinceLow, 2),
+          bounceFromLow5m: pct(e.bounceFromLow5m)
         };
       })(),
       entryZone: (() => {
@@ -4596,8 +5611,18 @@ setInterval(() => {
           rangeMode: z.range.mode,
           rangeOK: z.range.ok,
           rangeReason: z.range.reason,
+          supportEntryOK: z.supportEntryOK,
+          supportEntrySource: z.supportEntry?.source ?? null,
+          supportEntryPrice: num(z.supportEntry?.buyPrice, 6),
+          supportEntryDistancePct: num(z.supportEntry?.distancePct),
           capitalFractionIfBuy: alloc ? pct(alloc.fraction) : null,
-          allocationModeIfBuy: alloc?.mode ?? null
+          effectiveCapitalToUseIfBuy: alloc ? num(alloc.capital) : null,
+          multiPositionSlotCapIfBuy: alloc ? num(alloc.slotCap) : null,
+          effectiveCashFractionIfBuy: alloc && state.cash > 0 ? pct(alloc.capital / state.cash) : null,
+          allocationModeIfBuy: alloc?.mode ?? null,
+          supportCautionIfBuy: alloc?.supportCaution?.near ?? null,
+          supportPriceIfBuy: num(alloc?.supportCaution?.price, 6),
+          supportDistancePctIfBuy: pct(alloc?.supportCaution?.distancePct)
         };
       })(),
       highRangeCaution: (() => {
@@ -4645,15 +5670,36 @@ setInterval(() => {
     bidShare30s: pct(flow30s.bidShare),
     priceMove30s: pct(momentum30s.move),
 
+    openScalpPositions: openScalpPositions().map((p) => ({
+      id: p.id,
+      entry: p.entryPrice,
+      targetPlusOneCent: p.sellTarget,
+      investedUSDT: num(p.investedUSDT),
+      pearl: num(p.pearlReceived),
+      allocationMode: p.allocationMode ?? "NORMAL_SCALP",
+      allocationFraction: pct(p.allocationFraction ?? 1),
+      supportCaution: p.supportCautionAtEntry ?? null,
+      heldMinutes: num((Date.now() - p.entryTimeMs) / 60000, 2),
+      sellOrderPlacedAt: p.sellOrder?.placedAt ?? null
+    })),
+    openScalpPositionCount: openScalpPositions().length,
+    multiPositionSlotFraction: pct(MULTI_POSITION_MAX_CAPITAL_FRACTION),
+    minimumPositionSpacing: pct(MIN_POSITION_SPACING_PCT),
+
     pendingBuy: state.buyOrder
       ? {
           price: state.buyOrder.price,
           target: state.buyOrder.target,
-          staticPrice: true,
+          staticPrice: false,
+          supportRearmEnabled: true,
+          supportEntry: state.buyOrder.supportEntry ?? null,
           entrySignalType: state.buyOrder.entrySignalType ?? null,
           allocationMode: state.buyOrder.allocationMode ?? "NORMAL_SCALP",
           capitalToUse: num(state.buyOrder.cash),
           capitalFraction: pct(state.buyOrder.allocationFraction ?? 1),
+          supportCaution: state.buyOrder.supportCaution ?? null,
+          multiPositionSlotCap: num(state.buyOrder.multiPositionSlotCap),
+          openScalpPositions: openScalpPositions().length,
           reserveAfterFill: num(state.buyOrder.reserveAfterFill ?? 0),
           hardSignalConfirmed: Boolean(state.buyOrder.hardSignalConfirmedAt),
           hardSignalConfirmedAt: state.buyOrder.hardSignalConfirmedAt ?? null,
@@ -4669,6 +5715,8 @@ setInterval(() => {
           marketDistanceFromBuy: metric?.current
             ? pct(metric.current / state.buyOrder.price - 1)
             : null,
+          supportRearmEnabled: true,
+          supportEntry: state.buyOrder.supportEntry ?? null,
           structuralBreakPrice: num(
             state.buyOrder.price * (1 - PENDING_BREAK_BELOW_BUY),
             4
@@ -4687,7 +5735,7 @@ setInterval(() => {
     position: state.position
       ? {
           entry: state.position.entryPrice,
-          target045: state.position.sellTarget,
+          targetPlusOneCent: state.position.sellTarget,
           allocationMode: state.position.allocationMode ?? "NORMAL_SCALP",
           investedUSDT: num(state.position.investedUSDT),
           cashReserve: num(state.cash),
@@ -4745,14 +5793,14 @@ setInterval(() => {
     peakRealizedProfit: num(state.peakRealizedProfit),
     riskableProfitBuffer: num(riskableProfitBuffer()),
 
-    marketExitNetNow: state.mode === "SELL_LIMIT"
-      ? num(simulateMarketSell(state.pearl)?.netUSDT)
+    marketExitNetNow: state.position
+      ? num(simulateMarketSell(state.position.pearlReceived, buyFeeUSDT(state.position))?.netUSDT)
       : null,
 
-    marketExitWouldRespectFloor: state.mode === "SELL_LIMIT"
+    marketExitWouldRespectFloor: state.position
       ? (() => {
-          const sim = simulateMarketSell(state.pearl);
-          return sim ? sim.netUSDT + 1e-9 >= protectedCapitalFloor() : null;
+          const sim = simulateMarketSell(state.position.pearlReceived, buyFeeUSDT(state.position));
+          return sim ? sim.netUSDT + 1e-9 >= protectedCapitalFloor(state.position) : null;
         })()
       : null,
 
@@ -4777,9 +5825,14 @@ setInterval(() => {
     breakdownLocksCreated: state.breakdownLocksCreated || 0,
     breakdownLocksReleased: state.breakdownLocksReleased || 0,
     highRangeCautionOrders: state.highRangeCautionOrders || 0,
+    softFallingCautionOrders: state.softFallingCautionOrders || 0,
+    entryStabilityBlocks: state.entryStabilityBlocks || 0,
+    entryStabilityCancels: state.entryStabilityCancels || 0,
     fallingMarketLocksCreated: state.fallingMarketLocksCreated || 0,
     fallingMarketLocksReleased: state.fallingMarketLocksReleased || 0,
     fallingMarketEntriesBlocked: state.fallingMarketEntriesBlocked || 0,
+    positionSpacingBlocks: state.positionSpacingBlocks || 0,
+    scalpPositionsOpened: state.scalpPositionsOpened || 0,
 
     maxDrawdown: pct(state.maxDrawdown)
   };
@@ -4796,14 +5849,14 @@ setInterval(() => {
 
 console.log(`
 =========================================================
-PEARL / USDT PAPER SCALPER V5.1.8
+PEARL / USDT PAPER SCALPER V5.2.0 AUTO +$0.0100 / 10K
 =========================================================
 
 CAPITAL FICTICIO:
 ${START_CAPITAL} USDT
 
 TARGET NORMAL:
-+0.4500% BRUTO
+ENTRY + $0.0100 PEARL
 
 FEES MODELADAS:
 BUY  ${pct(BUY_FEE)}
@@ -4821,23 +5874,28 @@ NO EXISTE:
 
 SÍ EXISTE:
 - fill causal ESTRICTO por tiempo de observación
-- V5.1.8: un trade del mismo batch que creó la orden NUNCA puede llenarla
-- V5.1.8: BUY/SELL registran orderPlacedAt + tradeExchangeTime + causalAgeMs
-- V5.1.8: SELL LIMIT se imprime explícitamente al abrirse
-- V5.1.8: trade que ATRAVIESA una LIMIT = FULL FILL inmediato
-- V5.1.8: trade EXACTO en la LIMIT = respeta cola + tamaño propio
-- V5.1.8: target normal +0.45% bruto
-- V5.1.8: STARTUP_CONTEXT_LOCK observa 4 min LIVE antes de permitir la primera BUY
-- V5.1.8: <=75% rango24h puede usar 100%; 75–82% máximo 30%; >82% NO RANGE BUY
-- V5.1.8: PRICE_LADDER: high24h=1.8722 => BUY <1.8000; romper 1.9000+1 tick habilita 1.8x
-- V5.1.8: ruptura estructural => RECOVERY_HOLD; NO venta inmediata
-- V5.1.8: RECOVERY_HOLD activa FALLING_MARKET_LOCK sobre el cash restante
-- V5.1.8: FALLING_MARKET_LOCK puede activarse PRE-ENTRY durante una caída
-- V5.1.8: durante FALLING_MARKET_LOCK NO hay nuevas BUY, aunque haya cash
-- V5.1.8: lock cae solo con STABLE_ENOUGH usando 10m + 5m + 30s + flow5m
-- RECOVERY_HOLD sale en break-even neto (+0.02% buffer)
+- V5.1.8.3: un trade del mismo batch que creó la orden NUNCA puede llenarla
+- V5.1.8.3: BUY/SELL registran orderPlacedAt + tradeExchangeTime + causalAgeMs
+- V5.1.8.3: SELL LIMIT se imprime explícitamente al abrirse
+- V5.1.8.3: trade que ATRAVIESA una LIMIT = FULL FILL inmediato
+- V5.1.8.3: trade EXACTO en la LIMIT = respeta cola + tamaño propio
+- V5.2.0: target normal = entry + $0.0100 PEARL
+- V5.1.8.3: MULTI-POSITION: una BUY pendiente máxima + múltiples SELL LIMIT independientes
+- V5.2.0: una operación usa 100% del cash disponible; 30% solo si la entrada queda a <=0.30% del soporte
+- V5.1.8.3: nuevas entradas exigen >=0.25% de separación de toda posición/recovery abierta
+- V5.1.8.3: STARTUP_CONTEXT_LOCK observa 4 min LIVE antes de permitir la primera BUY
+- V5.2.0: el rango 24h bloquea la parte alta salvo que exista una BUY alineada con soporte
+- V5.1.8.3: PRICE_LADDER: high24h=1.8722 => BUY <1.8000; romper 1.9000+1 tick habilita 1.8x
+- V5.1.8.3: ruptura estructural => RECOVERY_HOLD; NO venta inmediata
+- V5.1.8.3: RECOVERY_HOLD activa FALLING_MARKET_LOCK sobre el cash restante
+- V5.1.8.3: HARD_FALLING_LOCK puede activarse PRE-ENTRY solo ante desplome/slow-bleed fuerte
+- V5.2.0: SOFT_FALLING_CONTEXT queda como contexto; solo el soporte cercano activa 30%
+- V5.1.8.3: PREENTRY HARD LOCK libera tras >=2 min sin nuevo low + 5m/30s estables + rebote
+- V5.1.8.3: durante HARD_FALLING_LOCK NO hay nuevas BUY, aunque haya cash
+- V5.1.8.3: lock cae solo con STABLE_ENOUGH usando 10m + 5m + 30s + flow5m
+- RECOVERY_HOLD conserva SELL en entry + $0.0100; solo el hard stop anclado puede cerrar con pérdida
 - RECOVERY_HOLD: -10% SOLO arma RECOVERY_DANGER; NO vende
-- V5.1.8: hard stop solo si rompe low24hAnchor -1.5% por ~2 min + presión vendedora + no reclaim
+- V5.1.8.3: hard stop solo si rompe low24hAnchor -1.5% por ~2 min + presión vendedora + no reclaim
 - BREAKDOWN_LOCK bloquea recompra del soporte roto
 - lock se libera por reclaim confirmado 2 min o nuevo soporte >=0.50% más abajo
 - capital PAPER extra se inyecta con PAPER_INJECT_USDT + PAPER_INJECT_ID
@@ -4845,21 +5903,21 @@ SÍ EXISTE:
 - la LIMIT gana tiempo descansando en el libro
 - señal dura se valida mientras la orden ya está armada
 - TTL BUY = 90 s
-- BUY estática durante todo el intento
+- BUY anclada al soporte; se rearma solo si el soporte se desplaza hacia abajo
 - NO reprice alcista / NO perseguir el precio
 - si no llena en 90 s: TTL_EXPIRED → cancelar → recalcular desde cero
 - early arm NO espera ASK5m/drawdown/rango duro; arma la LIMIT apenas existe zona maker válida
 - ASK5m queda como CONTEXTO y dentro del hardSignal; NO bloquea EARLY_ARM
 - hardSignal sigue registrándose como confirmación posterior; NO es requisito para fill
-- V5.1.8: tradeUpdate se procesa incluso durante bootstrap/reconexión
-- V5.1.8: fallback REST de trades cada 5 s si el WS de trades queda silencioso
-- V5.1.8: ticker.close/libro pueden dar referencia para EARLY_ARM; NUNCA generan fills
-- soporte 60m automático SOLO como referencia bajista
+- V5.1.8.3: tradeUpdate se procesa incluso durante bootstrap/reconexión
+- V5.1.8.3: fallback REST de trades cada 5 s si el WS de trades queda silencioso
+- V5.1.8.3: ticker.close/libro pueden dar referencia para EARLY_ARM; NUNCA generan fills
+- V5.2.0: soporte 60m o 120m puede activar la BUY; la otra ventana es confirmación
 - ticker rolling 24h BigONE: open/high/low/close/volume
-- HIGH 24h = ENTRY LADDER dinámico; no compramos en su misma banda de 0.10
-- V5.1.8 existe ENTRY ZONE gate para evitar congelar capital cerca del high24h
+- HIGH 24h = ENTRY LADDER dinámico; una entrada en soporte puede saltar la banda
+- V5.2.0 existe ENTRY ZONE guiada por soporte para evitar comprar cerca del high24h
 - targetSeenRecently es ADVISORY, no requisito
-- BUY pendiente NO se cancela por tocar/cruzar ligeramente la entrada
+- BUY pendiente solo se cancela por TTL, caída estructural o soporte desplazado/inválido
 - cancelación solo por ruptura estructural confirmada:
     edad >=30 s
     mercado >=0.30% debajo de BUY
@@ -4881,23 +5939,24 @@ SÍ EXISTE:
 - capital nuevo/reseva queda líquido; FALLING_MARKET_LOCK impide usarlo hasta STABLE_ENOUGH
 - si vender el scalp dejaría menos que su floor:
     NO VENDE; mantiene la posición activa
-- target normal SIEMPRE +0.45% bruto
+- target normal SIEMPRE = entry + $0.0100 PEARL
 - FLOW 5 min = contexto
 - FLOW 30 s = micro momentum + confirmación de ruptura, nunca persecución alcista
 
-ESTRUCTURA V5.1.8:
-- NORMAL_SCALP = target +0.45%
+ESTRUCTURA V5.1.8.3:
+- NORMAL_SCALP = target absoluto entry + $0.0100
 - STARTUP_CONTEXT_LOCK = 4 min + >=20 trades LIVE antes de primera BUY
-- RANGE SIZING = <=75% usa 100%; 75–82% usa 30%; >82% bloquea RANGE BUY
+- SIZING = 100% por defecto; 30% solo a <=0.30% sobre soporte; soporte válido puede saltar el veto de rango
 - FALLING_MARKET_LOCK = cash líquido bloqueado durante caída, sin nuevas BUY
+- ENTRY_STABILITY_GATE = precio permitido NO implica compra; exige que la caída se estabilice
 - STABLE_ENOUGH = no new low + 10m/5m/30s/flow estabilizados
 - RECOVERY_HOLD = inventario atrapado; -10% danger; hard stop solo por low24hAnchor confirmado
 - BREAKDOWN_LOCK = anti-whipsaw; no recomprar soporte roto inmediatamente
 - FLOW 30 s = micro momentum
 - 5 min = señal inmediata de scalp
-- soporte 60m = referencia bajista automática
+- soporte 60m/120m = selector de entrada y referencia bajista automática
 - ticker 24h BigONE = rango intradía real
-- high 24h = escalón dinámico: una banda de 0.10 por debajo para RANGE BUY
+- high 24h = contexto de escalón; la BUY se coloca en soporte 60M/120M
 - low 24h = fallback de soporte si no hay soporte local confirmado
 - romper el siguiente escalón (ej. 1.9001) habilita la banda inferior recién conquistada (1.8x)
 
@@ -4908,7 +5967,7 @@ LOG:
 
 IMPORTANTE:
 marketSpreadObserved es solo el spread actual del libro.
-NO cambia el target de +0.45%.
+NO cambia el target absoluto de +$0.0100.
 
 A LAS 24 HORAS:
 - escribe summary_24h.json
@@ -4932,4 +5991,5 @@ const runtimeApi = createRuntimeApi({
   port: Number(process.env.PEARL_DASHBOARD_PORT || 4174),
 });
 runtimeApi.start();
+startBotControlApi();
 connect();

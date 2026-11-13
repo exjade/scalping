@@ -1,18 +1,18 @@
 # PEARL Paper Trading Dashboard
 
-Dashboard local para observar PEARL/USDT en modo paper. La API vive dentro del mismo proceso `node pearl-scalper-v5.1.8.cjs`; no inicia otro bot ni reconstruye sus métricas desde `state.json` o `events.jsonl`.
+Dashboard local para observar PEARL/USDT en modo paper. La API vive dentro del mismo proceso del bot V5.x; no inicia otro bot ni reconstruye sus métricas desde `state.json` o `events.jsonl`.
 
 ## Uso normal
 
 Desde `C:\Users\Trabajo\pearl-paper-scalper-v5_1_8`:
 
 ```powershell
-node pearl-scalper-v5.1.8.cjs
+node pearl-scalper-v5.2.0-auto-1cent-10k.cjs
 ```
 
 Abre <http://127.0.0.1:4174>. Ese mismo proceso sirve la página, expone el objeto runtime por HTTP/SSE y conserva muestras en `runtime_metrics.sqlite`.
 
-El API sólo acepta lecturas: `GET /api/health`, `GET /api/snapshot`, `GET /api/history` y `GET /events`. Escucha en `127.0.0.1`; no ofrece rutas de órdenes ni credenciales.
+El dashboard lee `GET /api/health`, `GET /api/snapshot`, `GET /api/history` y `GET /events`. Los botones de la página llaman únicamente al control local del bot (`POST /open`, `POST /close` y `POST /configure` en el puerto 4175): la configuración solo se cambia con el bot cerrado y sin posiciones; abrir/cerrar habilita o pausa nuevas entradas automáticas; no coloca órdenes manuales ni expone credenciales.
 
 ## Vista de desarrollo
 
@@ -33,7 +33,7 @@ npm run build
 
 ## Fuente runtime y persistencia
 
-La API llama a las métricas que el proceso V5.1.8 mantiene en memoria: último precio, ticker 24h, high/low, posición de rango, bid/ask, ventanas de flujo, entry zone, high-range caution, falling-market lock y salud del WebSocket. El dashboard usa ese objeto como fuente actual; los archivos JSON siguen aportando estado financiero, eventos, señales y fills persistidos.
+La API llama a las métricas que el proceso V5.2.0 mantiene en memoria: versión, target absoluto configurable, bank operativo configurable, sizing base de 100% con cautela de 30% solo cerca del soporte, último precio, ticker 24h, high/low, posición de rango, bid/ask, ventanas de flujo, entry zone, high-range context, falling-market lock, control del bot, salud del WebSocket y registro rolling de toques/rebotes de soporte-resistencia en 120 minutos. El dashboard usa ese objeto como fuente actual; los archivos JSON siguen aportando estado financiero, eventos, señales y fills persistidos.
 
 `runtime_metrics.sqlite` se crea junto a `state.json`. Guarda una muestra cada 10 segundos y conserva siete días; el gráfico carga hasta 24 horas. Al reiniciar, el bot reanuda el estado persistido en `state.json` y la base conserva la historia del dashboard. Las ventanas de trades en memoria se vuelven a formar con el flujo de mercado tras la reconexión.
 

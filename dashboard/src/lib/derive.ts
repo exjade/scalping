@@ -13,6 +13,7 @@ export type MarketData = {
   ask: number | null;
   rangePosition: number | null;
   support60m: number | null;
+  structure120m: JsonRecord | null;
   askShare30s: number | null;
   askShare5m: number | null;
   bidShare5m: number | null;
@@ -58,6 +59,28 @@ export function pickNumber(...values: unknown[]): number | null {
     if (parsed !== null) return parsed;
   }
   return null;
+}
+
+export function botConfiguration(runtimeValue: unknown, stateValue: unknown): {
+  version: string;
+  targetPriceDelta: number | null;
+  capital: number | null;
+  controlPort: number;
+  tradingEnabled: boolean | null;
+} {
+  const runtime = record(runtimeValue);
+  const state = record(stateValue);
+  const control = record(runtime.botControl);
+  const rawPort = Math.round(numberValue(control.controlPort) ?? 4175);
+  return {
+    version: String(runtime.version ?? state.version ?? ""),
+    targetPriceDelta: pickNumber(runtime.targetPriceDelta, control.targetPriceDelta, state.targetPriceDelta),
+    capital: pickNumber(runtime.operatingBank, control.operatingBank, state.operatingBank, runtime.capitalContributed, state.capitalContributed, state.capitalStart),
+    controlPort: Math.max(1, Math.min(65535, rawPort)),
+    tradingEnabled: typeof control.tradingEnabled === "boolean"
+      ? control.tradingEnabled
+      : typeof state.tradingEnabled === "boolean" ? state.tradingEnabled : null,
+  };
 }
 
 export function getPath(source: unknown, path: string): unknown {
@@ -128,6 +151,7 @@ export function deriveMarket(snapshot: BotSnapshot): MarketData {
   const runtimeFalling = record(runtimeRegime.fallingMarketLock);
   const runtimePreEntry = record(runtimeRegime.preEntryFalling);
   const runtimeEntryStability = record(runtimeRegime.entryStability);
+  const runtimeStructure120 = record(runtime.structure120m ?? state.structure120m);
   const runtimeLivePrice = pickNumber(runtime.lastPrice);
   const all = [...snapshot.events, ...snapshot.signals, ...snapshot.trades]
     .map((item) => ({ item, objects: nestedObjects(item) }))
@@ -268,7 +292,8 @@ export function deriveMarket(snapshot: BotSnapshot): MarketData {
 
   return {
     price, priceSource, priceTime, quoteTime, contextTime, open24h, high24h, low24h, bid, ask, rangePosition,
-    support60m, askShare30s, askShare5m, bidShare5m, move30s, move4m, move5m, move10m,
+    support60m, structure120m: Object.keys(runtimeStructure120).length ? runtimeStructure120 : null,
+    askShare30s, askShare5m, bidShare5m, move30s, move4m, move5m, move10m,
     bounceFromLow, minutesSinceLow, samples: uniqueSamples(samples),
   };
 }
@@ -327,12 +352,17 @@ export function exitTrades(snapshot: BotSnapshot): JsonRecord[] {
     if (trade.entryTime !== undefined || trade.buyTime !== undefined) return trade;
     const exitAt = eventTime(trade);
     const entry = pickNumber(trade.entryPrice, trade.buyPrice);
-    const candidates = buys.filter((buy) => {
+    const earlierBuys = buys.filter((buy) => {
       const buyAt = eventTime(buy);
-      if (usedBuys.has(buy) || buyAt === null || exitAt === null || buyAt > exitAt) return false;
+      return !usedBuys.has(buy) && buyAt !== null && exitAt !== null && buyAt <= exitAt;
+    });
+    const positionId = String(trade.positionId ?? "");
+    const idMatches = positionId ? earlierBuys.filter((buy) => String(buy.positionId ?? "") === positionId) : [];
+    const priceMatches = earlierBuys.filter((buy) => {
       const buyPrice = pickNumber(buy.entryPrice, buy.price);
       return entry === null || buyPrice === null || Math.abs(entry - buyPrice) < 0.0000001;
     });
+    const candidates = idMatches.length ? idMatches : priceMatches;
     const matched = candidates.at(-1);
     if (!matched) return trade;
     usedBuys.add(matched);
@@ -346,14 +376,20 @@ export function deriveEngine(stateValue: unknown, runtimeValue?: unknown): { mod
   const regime = record(runtime.regimeV519 ?? runtime.regimeV518);
   const buyOrder = record(state.buyOrder);
   const sellOrder = record(state.sellOrder);
-  const position = record(state.position);
+  const legacyPosition = record(state.position);
+  const scalpPositions = list(state.scalpPositions);
+  const positions = scalpPositions.length ? scalpPositions : Object.keys(legacyPosition).length ? [legacyPosition] : [];
+  const position = positions[0] ?? legacyPosition;
+  const sellOrders = positions.filter((item) => Object.keys(record(item.sellOrder)).length > 0);
   const recoveries = list(state.recoveryPositions);
   const runtimeLock = record(regime.fallingMarketLock);
   const lock = Object.keys(runtimeLock).length ? runtimeLock : record(state.fallingMarketLock);
   let mode = String(state.mode ?? "N/A").toUpperCase();
   let order: JsonRecord = {};
-  if (Object.keys(sellOrder).length) { mode = "SELL_LIMIT"; order = sellOrder; }
-  else if (Object.keys(buyOrder).length) { mode = "BUY_LIMIT"; order = buyOrder; }
+  if (Object.keys(buyOrder).length) { mode = positions.length ? "BUY_LIMIT + OPEN SCALPS" : "BUY_LIMIT"; order = buyOrder; }
+  else if (sellOrders.length > 1) { mode = "MULTIPLE SELL LIMITS"; order = record(sellOrders[0].sellOrder); }
+  else if (Object.keys(sellOrder).length || sellOrders.length === 1) { mode = "SELL_LIMIT"; order = Object.keys(sellOrder).length ? sellOrder : record(sellOrders[0].sellOrder); }
+  else if (positions.length) mode = "SCALP POSITION OPEN";
   else if (recoveries.length) mode = "RECOVERY_HOLD";
   else if (lock.active === true || String(lock.status ?? "").toUpperCase() === "ACTIVE") mode = "FALLING_MARKET_LOCK";
   const reason = String(lock.triggerReason ?? lock.releaseReason ?? lock.failedConditions ?? "");
@@ -395,6 +431,9 @@ export function feeRate(snapshot: BotSnapshot, side: "buy" | "sell"): number | n
   }
   if (side === "buy") {
     const inferred = snapshot.trades.map((trade) => {
+      const feeUSDT = pickNumber(trade.buyFeeUSDT, trade.buyFeeAmount);
+      const invested = pickNumber(trade.investedUSDT, trade.capitalBefore);
+      if (feeUSDT !== null && invested !== null && invested > 0) return feeUSDT / invested;
       const fee = pickNumber(trade.buyFeePearl, trade.buyFeeAmount);
       const gross = pickNumber(trade.grossPearl, trade.pearlGross);
       return fee !== null && gross !== null && gross > 0 ? fee / gross : null;
@@ -419,15 +458,49 @@ export function feeRate(snapshot: BotSnapshot, side: "buy" | "sell"): number | n
   return null;
 }
 
-export function entryExplanation(rangePosition: number | null, allocation: number | null, mode: string): string {
-  if (mode === "TOP_RANGE_BLOCKED" || (rangePosition !== null && rangePosition >= 0.82)) {
+export function deriveBuyDiagnostics(snapshot: BotSnapshot) {
+  const state = record(snapshot.state);
+  const events = snapshot.events;
+  const cancellationEvents = events.filter((item) => /BUY CANCELLED/i.test(String(item.type ?? "")));
+  const reason = (item: JsonRecord) => String(item.reason ?? item.cancelReason ?? "").toUpperCase();
+  const placedFromSignals = snapshot.signals.filter((item) => String(item.type ?? "").toUpperCase() === "BUY_LIMIT_PLACED").length;
+  const fills = (snapshot.trades.length ? snapshot.trades : events).filter((item) => /BUY_FILLED|BUY CROSS-THROUGH FILL/i.test(String(item.type ?? ""))).length;
+  const placed = pickNumber(state.buyOrdersPlaced) ?? placedFromSignals;
+  const cancelled = pickNumber(state.buyOrdersCancelled) ?? cancellationEvents.length;
+  const filled = pickNumber(state.buyOrdersFilled) ?? fills;
+  const countReason = (pattern: RegExp) => cancellationEvents.filter((item) => pattern.test(reason(item))).length;
+  return {
+    placed,
+    cancelled,
+    filled,
+    fillRate: placed && placed > 0 ? filled / placed : null,
+    ttlExpired: countReason(/TTL_EXPIRED/),
+    fallingLock: countReason(/FALLING_MARKET|FALLING/),
+    supportResize: countReason(/SUPPORT_CAUTION/),
+    softFallingResize: countReason(/SOFT_FALLING/),
+    userPaused: countReason(/BOT_PAUSED/),
+    otherCancelled: cancellationEvents.filter((item) => !/TTL_EXPIRED|FALLING|SUPPORT_CAUTION|SOFT_FALLING|BOT_PAUSED/i.test(reason(item))).length,
+    websocketErrors: events.filter((item) => /WS ERROR/i.test(String(item.type ?? ""))).length,
+    causalBlocks: events.filter((item) => /BUY FILL BLOCKED BY CAUSALITY/i.test(String(item.type ?? ""))).length,
+    lastCancellation: cancellationEvents.at(-1) ?? null,
+  };
+}
+
+export function entryExplanation(rangePosition: number | null, allocation: number | null, mode: string, supportEntryOK = false): string {
+  if (!supportEntryOK && (mode === "TOP_RANGE_BLOCKED" || (rangePosition !== null && rangePosition >= 0.82))) {
     return "Compra bloqueada: el precio está dentro de la banda superior del rango de 24 horas.";
   }
+  if (supportEntryOK) {
+    return "BUY orientada al soporte validado; 60M/120M funcionan como contexto y no como bloqueo simultáneo.";
+  }
+  if (mode === "SUPPORT_CAUTION") {
+    return "Asignación reducida al 30% porque la entrada está demasiado cerca del soporte detectado.";
+  }
   if (allocation !== null && allocation > 0 && allocation < 1) {
-    return "Asignación reducida porque el precio está en la zona de cautela del rango de 24 horas.";
+    return "Asignación reducida por la protección de soporte reportada por el runtime.";
   }
   if (mode === "FALLING_MARKET_LOCK") return "Sin nuevas compras mientras la protección de mercado espera estabilidad.";
-  if (rangePosition !== null && rangePosition >= 0.75) return "Zona de cautela: la asignación depende de las señales de agotamiento del bot.";
+  if (rangePosition !== null && rangePosition >= 0.75) return "Contexto de rango alto; el sizing base sigue en 100% salvo que la entrada esté cerca del soporte.";
   if (rangePosition !== null) return "El precio está en el rango normal; las demás condiciones de entrada siguen siendo determinantes.";
   return "La posición en el rango no está disponible en los archivos observados.";
 }

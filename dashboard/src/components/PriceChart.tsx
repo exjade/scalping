@@ -45,6 +45,14 @@ function makePoints(snapshot: BotSnapshot, market: MarketData): { points: ChartP
     values.set(time, sample.value);
     observedValues.set(time, sample.value);
   }
+  const livePrice = pickNumber(getPath(snapshot, "runtime.lastPrice"), market.price);
+  const liveTimeValue = getPath(snapshot, "generatedAt") ?? getPath(snapshot, "runtime.generatedAt") ?? market.priceTime;
+  const liveTimeMs = typeof liveTimeValue === "number" ? liveTimeValue : typeof liveTimeValue === "string" ? Date.parse(liveTimeValue) : NaN;
+  const liveSecond = livePrice !== null && livePrice > 0 && Number.isFinite(liveTimeMs) ? Math.floor(liveTimeMs / 1000) : null;
+  if (liveSecond !== null && livePrice !== null) {
+    values.set(liveSecond, livePrice);
+    observedValues.set(liveSecond, livePrice);
+  }
   const markers: ChartMarker[] = [];
 
   for (const trade of snapshot.trades) {
@@ -122,6 +130,13 @@ function makePoints(snapshot: BotSnapshot, market: MarketData): { points: ChartP
       shape: isLock ? "square" : "circle",
       text: type.includes("LOCK") ? /RELEASE|RELEASED/.test(type) ? "U" : "L" : type.includes("CAUTION") ? "C" : type.includes("RECOVERY") ? "R" : type.includes("BREAKDOWN") ? "D" : "T",
     });
+  }
+
+  // SQLite history is loaded at dashboard boot; this live point follows SSE
+  // snapshots so the chart stays aligned with the runtime price between DB samples.
+  if (liveSecond !== null && livePrice !== null) {
+    values.set(liveSecond, livePrice);
+    observedValues.set(liveSecond, livePrice);
   }
 
   const uniqueMarkers = new Map<string, ChartMarker>();
@@ -207,11 +222,19 @@ export function PriceChart({ snapshot, market }: Props) {
     addLine(market.high24h, "24H HIGH", "rgba(221,151,139,.62)");
     addLine(market.low24h, "24H LOW", "rgba(110,190,155,.62)");
     addLine(market.support60m, "SUPPORT 60M", "rgba(131,169,233,.60)");
+    addLine(numberValue(getPath(market.structure120m, "support.price")), "SUPPORT 120M", "rgba(99,201,155,.58)");
+    addLine(numberValue(getPath(market.structure120m, "resistance.price")), "RESISTANCE 120M", "rgba(225,139,131,.58)");
     const highAnchor = numberValue(snapshot.state?.low24hAnchor);
     if (highAnchor !== null && highAnchor !== market.low24h) addLine(highAnchor, "RECOVERY ANCHOR", "rgba(221,171,104,.6)");
-    const position = snapshot.state?.position && typeof snapshot.state.position === "object" ? snapshot.state.position as JsonRecord : {};
-    addLine(numberValue(position.entryPrice), "ENTRY", "rgba(131,169,233,.48)");
-    addLine(numberValue(position.sellTarget ?? position.target), "TARGET", "rgba(130,200,164,.55)");
+    const scalpPositions = Array.isArray(snapshot.state?.scalpPositions) ? snapshot.state.scalpPositions : [];
+    const legacyPosition = snapshot.state?.position && typeof snapshot.state.position === "object" ? snapshot.state.position as JsonRecord : null;
+    const visiblePositions = scalpPositions.length ? scalpPositions : legacyPosition ? [legacyPosition] : [];
+    visiblePositions.forEach((item, index) => {
+      const position = item as JsonRecord;
+      const sellOrder = position.sellOrder && typeof position.sellOrder === "object" ? position.sellOrder as JsonRecord : {};
+      addLine(numberValue(position.entryPrice), `P${index + 1} BUY`, "rgba(131,169,233,.58)");
+      addLine(numberValue(sellOrder.price ?? position.sellTarget ?? position.target), `P${index + 1} SELL LIMIT`, "rgba(130,200,164,.58)");
+    });
     const recoveries = Array.isArray(snapshot.state?.recoveryPositions) ? snapshot.state.recoveryPositions : [];
     recoveries.forEach((item, index) => {
       if (!item || typeof item !== "object") return;
@@ -219,6 +242,7 @@ export function PriceChart({ snapshot, market }: Props) {
       const anchor = numberValue(recovery.low24hAnchor ?? recovery.anchorPrice);
       const hardStop = numberValue(recovery.hardStopBreakPrice ?? recovery.anchorBreakPrice);
       addLine(anchor, `RECOVERY ANCHOR ${index + 1}`, "rgba(221,171,104,.6)");
+      addLine(numberValue(recovery.recoveryTarget), `RECOVERY SELL ${index + 1}`, "rgba(181,147,223,.58)");
       addLine(hardStop, `HARD STOP ${index + 1}`, "rgba(222,130,124,.58)");
     });
     if (!fittedRef.current && chartData.points.length > 1) {
@@ -231,6 +255,7 @@ export function PriceChart({ snapshot, market }: Props) {
     <div className="chart-wrap">
       <div className="chart-legend">
         <span><i className="legend-dot legend-price" />Price</span>
+        <span><i className="legend-dot legend-live" />LIVE · runtime</span>
         <span><i className="legend-line legend-high" />24h high / low</span>
         <span><i className="legend-dot legend-buy" />B · BUY</span>
         <span><i className="legend-dot legend-sell" />S · SELL</span>
