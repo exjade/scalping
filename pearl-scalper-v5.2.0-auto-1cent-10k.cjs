@@ -170,7 +170,8 @@ const ENTRY_STABILITY_TIGHT_RANGE_5M = 0.0030;       // o rango5m <=0.30%
 // Si una posición pasa a RECOVERY_HOLD por ruptura estructural, el cash
 // restante NO se reutiliza durante la caída. El lock solo se libera cuando
 // el mercado deja de hacer nuevos lows materiales y 10m/5m/30s muestran
-// estabilidad suficiente. No intenta predecir el fondo; evita comprar cada escalón.
+// estabilidad suficiente. El pre-entry hard lock tiene una ventana de rebote
+// acotada; el recovery lock sigue sin permitir nuevas BUY.
 // PRE-ENTRY HARD lock: liberación más rápida una vez desaparece el desplome.
 // Los locks nacidos desde RECOVERY mantienen la confirmación conservadora de 5m.
 const PREENTRY_HARD_LOCK_MIN_MS = 2 * 60 * 1000;
@@ -178,6 +179,12 @@ const PREENTRY_HARD_LOCK_NO_NEW_LOW_MS = 2 * 60 * 1000;
 const PREENTRY_HARD_RELEASE_MAX_DROP_5M = 0.0025;     // move5m >= -0.25%
 const PREENTRY_HARD_RELEASE_MAX_DROP_30S = 0.0015;   // move30s >= -0.15% o N/A
 const PREENTRY_HARD_RELEASE_MIN_BOUNCE_5M = 0.0025;  // +0.25% desde low5m
+const PREENTRY_REBOUND_MIN_LOCK_AGE_MS = 30 * 1000;
+const PREENTRY_REBOUND_NO_NEW_LOW_MS = 15 * 1000;
+const PREENTRY_REBOUND_MIN_BOUNCE_FROM_LOCK = 0.0040; // +0.40% desde el low del lock
+const PREENTRY_REBOUND_MIN_MOVE_5M = 0.0010;           // +0.10% en 5m
+const PREENTRY_REBOUND_MAX_DROP_30S = 0.0015;          // no entrar si vuelve a caer fuerte
+const PREENTRY_REBOUND_MAX_ASK_SHARE_5M = 0.70;
 
 const FALLING_LOCK_MIN_MS = 5 * 60 * 1000;
 const FALLING_LOCK_NO_NEW_LOW_MS = 5 * 60 * 1000;
@@ -2033,7 +2040,56 @@ function updateFallingMarketLock(referencePrice) {
   return changed;
 }
 
-function fallingMarketEntryGate(referencePrice = null) {
+function fallingMarketReboundContext(referencePrice = null, buyPrice = null, entryZone = null) {
+  const lock = activeFallingMarketLock();
+  if (!lock) {
+    return { ok: false, reason: "NO_ACTIVE_LOCK", failedConditions: [] };
+  }
+
+  const now = Date.now();
+  const current = Number.isFinite(referencePrice)
+    ? referencePrice
+    : (marketReferencePrice()?.price ?? null);
+  const w5 = tradeWindowStats(5 * 60 * 1000);
+  const mom30 = priceMomentum(now, 30 * 1000);
+  const flow5 = flowMetrics(now, 5 * 60 * 1000);
+  const currentRange = rangePositionEntryContext(current);
+  const isPreEntryHardLock = String(lock.triggerReason || "").startsWith("PREENTRY_");
+  const lockAgeOK = now - Number(lock.createdAtMs || now) >= PREENTRY_REBOUND_MIN_LOCK_AGE_MS;
+  const noNewLowOK = now - Number(lock.lastMeaningfulNewLowAtMs || lock.createdAtMs || now) >= PREENTRY_REBOUND_NO_NEW_LOW_MS;
+  const bounceFromLock = Number.isFinite(current) && Number.isFinite(lock.lowSinceLock) && lock.lowSinceLock > 0
+    ? current / lock.lowSinceLock - 1
+    : null;
+
+  const conditions = {
+    preEntryHardLock: isPreEntryHardLock,
+    lockAgeOK,
+    noNewLowOK,
+    bounceFromLockOK: bounceFromLock !== null && bounceFromLock >= PREENTRY_REBOUND_MIN_BOUNCE_FROM_LOCK,
+    fiveMinuteRising: w5.ready && w5.move !== null && w5.move >= PREENTRY_REBOUND_MIN_MOVE_5M,
+    microNotFalling: mom30.move === null || mom30.move >= -PREENTRY_REBOUND_MAX_DROP_30S,
+    sellPressureContained: flow5.askShare === null || flow5.askShare <= PREENTRY_REBOUND_MAX_ASK_SHARE_5M,
+    currentRangeOK: currentRange.ok,
+    candidateEntryOK: Boolean(entryZone?.ok && Number.isFinite(buyPrice))
+  };
+
+  return {
+    ok: Object.values(conditions).every(Boolean),
+    conditions,
+    failedConditions: failedConditionNames(conditions),
+    current,
+    buyPrice,
+    bounceFromLock,
+    currentRangePosition24h: currentRange.rangePosition24h,
+    move5m: w5.move ?? null,
+    momentum30s: mom30.move ?? null,
+    askShare5m: flow5.askShare,
+    lockAgeSeconds: (now - Number(lock.createdAtMs || now)) / 1000,
+    secondsSinceMeaningfulNewLow: (now - Number(lock.lastMeaningfulNewLowAtMs || lock.createdAtMs || now)) / 1000
+  };
+}
+
+function fallingMarketEntryGate(referencePrice = null, context = {}) {
   const lock = activeFallingMarketLock();
   const entryStability = entryStabilityContext(referencePrice);
   const preEntry = preEntryFallingContext(referencePrice);
@@ -2046,19 +2102,26 @@ function fallingMarketEntryGate(referencePrice = null) {
       entryStability,
       preEntry,
       softCaution: preEntry.softCaution,
-      hardLock: false
+      hardLock: false,
+      rebound: { ok: false, reason: "NO_ACTIVE_LOCK", failedConditions: [] }
     };
   }
 
   const stability = fallingMarketStabilityContext(referencePrice);
+  const rebound = fallingMarketReboundContext(
+    referencePrice,
+    context.buyPrice ?? null,
+    context.entryZone ?? null
+  );
   return {
-    ok: false,
-    lockId: lock.id,
+    ok: rebound.ok,
+    lockId: rebound.ok ? null : lock.id,
     stability,
     entryStability,
     preEntry,
     softCaution: false,
-    hardLock: true
+    hardLock: true,
+    rebound
   };
 }
 
@@ -2934,9 +2997,9 @@ function buildHardSignal(ignoreMode = false) {
 
   const target = targetPriceForEntry(buyPrice);
   const supportContext = supportContext60m(metric.current);
-  const fallingGate = fallingMarketEntryGate(metric.current);
   const startupGate = startupContextStatus(metric.current);
   const entryZone = entryZoneContext(buyPrice, metric);
+  const fallingGate = fallingMarketEntryGate(metric.current, { buyPrice, entryZone });
   const breakdownGate = breakdownEntryGate(
     metric,
     entryZone.supportEntry?.support ? { support: entryZone.supportEntry.support } : supportContext
@@ -2946,7 +3009,7 @@ function buildHardSignal(ignoreMode = false) {
     scalpCapitalOK: state.cash >= MIN_SCALP_CASH_USDT,
     startupContextOK: startupGate.ready,
     fallingMarketLockOK: !fallingGate.lockId,
-    entryStabilityOK: fallingGate.entryStability?.ok ?? true,
+    entryStabilityOK: fallingGate.rebound?.ok || (fallingGate.entryStability?.ok ?? true),
     breakdownLockOK: breakdownGate.ok,
     priceLadderOK: entryZone.ladder.ok || entryZone.supportEntryOK,
     rangePosition24hOK: entryZone.range.ok || entryZone.supportEntryOK,
@@ -3008,9 +3071,9 @@ function buildEarlyArmSignal(ignoreMode = false) {
   const distanceToBuy = buyPrice > 0
     ? metric.current / buyPrice - 1
     : null;
-  const fallingGate = fallingMarketEntryGate(metric.current);
   const startupGate = startupContextStatus(metric.current);
   const entryZone = entryZoneContext(buyPrice, metric);
+  const fallingGate = fallingMarketEntryGate(metric.current, { buyPrice, entryZone });
   const breakdownGate = breakdownEntryGate(
     metric,
     entryZone.supportEntry?.support ? { support: entryZone.supportEntry.support } : supportContext
@@ -4755,7 +4818,6 @@ function processLiveTrade(rawTrade, source = "WS", observationMeta = {}) {
     if (!startup.ready) return;
 
     maybeActivatePreEntryFallingLock(trade.price);
-    if (activeFallingMarketLock()) return;
 
     const earlySignal = buildEarlyArmSignal();
     if (earlySignal?.ok) {
@@ -5101,7 +5163,7 @@ function entryDiagnostics() {
 
 let latestStatusObject = null;
 
-function activeFallingLockSnapshot(currentPrice, stability) {
+function activeFallingLockSnapshot(currentPrice, stability, rebound) {
   const lock = activeFallingMarketLock();
   return lock
     ? {
@@ -5118,6 +5180,11 @@ function activeFallingLockSnapshot(currentPrice, stability) {
         momentum30s: pct(stability.momentum30s),
         askShare5m: pct(stability.askShare5m),
         bounceFromLow5m: pct(stability.bounceFromLow5m),
+        reboundEntryOK: rebound?.ok === true,
+        reboundFailedConditions: rebound?.failedConditions?.join(", ") || null,
+        reboundBounceFromLock: pct(rebound?.bounceFromLock),
+        reboundMove5m: pct(rebound?.move5m),
+        reboundCurrentRangePosition24h: pct(rebound?.currentRangePosition24h),
         reservedCash: num(state.cash),
         currentPrice,
       }
@@ -5315,7 +5382,11 @@ function liveJsonStatus() {
         sellPressure: highRange.sellPressure,
         microDrop: highRange.microDrop,
       },
-      fallingMarketLock: activeFallingLockSnapshot(currentPrice, stability),
+      fallingMarketLock: activeFallingLockSnapshot(
+        currentPrice,
+        stability,
+        fallingMarketReboundContext(currentPrice, previewBuyPrice, zone)
+      ),
     },
     earlyArm: diag.earlyArm,
     hardSignal: diag.hardSignal,
@@ -5891,7 +5962,7 @@ SÍ EXISTE:
 - V5.1.8.3: HARD_FALLING_LOCK puede activarse PRE-ENTRY solo ante desplome/slow-bleed fuerte
 - V5.2.0: SOFT_FALLING_CONTEXT queda como contexto; solo el soporte cercano activa 30%
 - V5.1.8.3: PREENTRY HARD LOCK libera tras >=2 min sin nuevo low + 5m/30s estables + rebote
-- V5.1.8.3: durante HARD_FALLING_LOCK NO hay nuevas BUY, aunque haya cash
+- V5.1.8.3: HARD_FALLING_LOCK solo permite una BUY pre-entry durante rebote validado y bajo TOP_RANGE_BLOCKED
 - V5.1.8.3: lock cae solo con STABLE_ENOUGH usando 10m + 5m + 30s + flow5m
 - RECOVERY_HOLD conserva SELL en entry + $0.0100; solo el hard stop anclado puede cerrar con pérdida
 - RECOVERY_HOLD: -10% SOLO arma RECOVERY_DANGER; NO vende

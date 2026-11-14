@@ -103,6 +103,13 @@ test("derives V5.2 target, bank and local control from the live runtime", () => 
   });
 });
 
+test("shows a rebound scalp window while the protection lock remains active", () => {
+  assert.equal(deriveEngine({
+    mode: "WAITING",
+    fallingMarketLock: { status: "ACTIVE", reboundEntryOK: true },
+  }).mode, "REBOUND_SCALP_WINDOW");
+});
+
 test("explains why BUY limits did not fill", () => {
   const snapshot: BotSnapshot = {
     mode: "live", generatedAt: new Date().toISOString(),

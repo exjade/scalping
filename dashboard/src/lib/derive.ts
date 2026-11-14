@@ -391,6 +391,7 @@ export function deriveEngine(stateValue: unknown, runtimeValue?: unknown): { mod
   else if (Object.keys(sellOrder).length || sellOrders.length === 1) { mode = "SELL_LIMIT"; order = Object.keys(sellOrder).length ? sellOrder : record(sellOrders[0].sellOrder); }
   else if (positions.length) mode = "SCALP POSITION OPEN";
   else if (recoveries.length) mode = "RECOVERY_HOLD";
+  else if (lock.reboundEntryOK === true && (lock.active === true || String(lock.status ?? "").toUpperCase() === "ACTIVE")) mode = "REBOUND_SCALP_WINDOW";
   else if (lock.active === true || String(lock.status ?? "").toUpperCase() === "ACTIVE") mode = "FALLING_MARKET_LOCK";
   const reason = String(lock.triggerReason ?? lock.releaseReason ?? lock.failedConditions ?? "");
   return { mode, reason, order, position };
